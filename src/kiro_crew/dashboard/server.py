@@ -519,6 +519,9 @@ _MIXED_INTERNAL_API_PATHS = frozenset(
         # prefix covers every /api/remote-artifacts/{provider}/... sub-route.
         "/api/remote-artifacts",
         "/api/workflows",  # DW engine: MCP tools + Workflows tab polling
+        # Strict session-bound structured monitor read. The exact leaf avoids
+        # granting internal-secret access to the sibling AutoNudge mutations.
+        "/api/autonudge/session-monitor",
         "/api/deploy",  # MCP deploy_artifact tool — server enforces preview-only (confirm/override_scan stripped for internal-secret callers)
         # Issue Radar investigation record — the ONE app route reachable with the
         # internal secret, for the ``issue_radar_record_investigation`` MCP tool.
@@ -1173,13 +1176,27 @@ def _register_mcp_routes(app: web.Application) -> None:
         api_autonudge_list,
         api_autonudge_start,
         api_autonudge_update,
+        api_monitor_create,
+        api_monitor_restart,
+        api_monitor_slot_get,
+        api_monitor_stop,
+        api_monitor_update,
+        api_monitors_list,
+        api_session_monitor_get,
     )
 
     app.router.add_get("/api/autonudge", api_autonudge_list)
+    app.router.add_get("/api/autonudge/session-monitor", api_session_monitor_get)
     app.router.add_post("/api/autonudge", api_autonudge_start)
     app.router.add_get("/api/autonudge/slot/{slot_key}", api_autonudge_get)
     app.router.add_patch("/api/autonudge/{loop_id}", api_autonudge_update)
     app.router.add_delete("/api/autonudge/{loop_id}", api_autonudge_delete)
+    app.router.add_get("/api/monitors", api_monitors_list)
+    app.router.add_post("/api/monitors", api_monitor_create)
+    app.router.add_get("/api/monitors/slot/{slot_key}", api_monitor_slot_get)
+    app.router.add_patch("/api/monitors/{monitor_id}", api_monitor_update)
+    app.router.add_post("/api/monitors/{monitor_id}/stop", api_monitor_stop)
+    app.router.add_post("/api/monitors/{monitor_id}/restart", api_monitor_restart)
 
     # Agent questions — blocking question-card round-trip for the ask_question
     # MCP tool. The POST holds open until the user answers, so it must not be

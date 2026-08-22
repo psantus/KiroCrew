@@ -164,8 +164,17 @@ The tool acknowledgement means “the request was accepted for application,” n
 are authoritative. The UI must use that language as well.
 
 `monitor_update` changes cadence, budgets, or wake instructions without resetting
-the observation fingerprint unless the target or objective changes.
+the observation fingerprint unless the target or objective changes. Every durable
+target/objective edit advances a configuration generation; a probe applies only
+against the generation and target it captured. Identity edits are refused while
+an action wake is in flight so completion correlation and accounting remain valid.
+Creating a replacement monitor is refused under the same condition; the existing
+monitor ID remains authoritative until its correlated completion is charged.
 `monitor_stop` records an explicit terminal outcome instead of deleting evidence.
+When the in-flight action itself stops its monitor before its raw completion
+event, the terminal record retains that wake's correlation until completion
+charges and clears it. Missing or duplicate completion cannot re-arm, redispatch,
+or double-charge the terminal record.
 
 ### 2. Durable model: typed state beside legacy loops
 
@@ -178,8 +187,9 @@ The monitor payload contains at least:
 ```text
 kind, version, target, objective
 last_observation, last_fingerprint, last_observed_at
-last_wake_fingerprint, wake_in_flight
-agent_turns, input_tokens, output_tokens
+config_generation, last_wake_fingerprint, wake_in_flight
+wake_delivery, completion_evidence_deadline
+wake_count, agent_turns, input_tokens, output_tokens
 consecutive_provider_errors, next_probe_at
 outcome, stopped_reason, stopped_at
 ```
@@ -299,9 +309,25 @@ Every delivery surface reports a completion result to the controller containing:
 
 The controller charges budgets and clears in-flight state only from this callback.
 Dashboard, Slack, and Discord therefore share the same completed-turn boundary.
-If dispatch fails before a turn starts, no agent-turn or token budget is charged.
-If completion evidence is unavailable, the monitor fails closed after a bounded
-recovery path rather than issuing an unbounded duplicate wake.
+Before completion, every surface reports one typed handoff result: `DISPATCHED`
+means the action was accepted and starts a durable, bounded evidence deadline;
+`BUSY` durably rearms the already-claimed wake for a short retry without another
+probe or model turn; `UNAVAILABLE` is terminal. If dispatch fails before a turn
+starts, no agent-turn or token budget is charged. Stream exhaustion is dispatch,
+not completion. If the evidence deadline expires without a raw completion event,
+the monitor atomically retains `completion_evidence_unavailable`, clears the
+claim, and fails closed rather than issuing a duplicate wake. Restart resumes a
+persisted `BUSY` claim at its existing retry deadline. Cadence edits affect only
+future probes: they cannot replace an in-flight BUSY retry or accepted-dispatch
+evidence deadline, re-arm its timer, or postpone runtime enforcement.
+`wake_count` increments once when an actionable wake is first accepted as
+`DISPATCHED` (or when its raw completion wins the handoff race). `BUSY` retries,
+restart recovery, duplicate handoff reports, and `UNAVAILABLE` do not increment
+it.
+Discord makes this handoff at its dispatcher concurrency boundary: a monitor wake
+that loses the session race is `BUSY` and is neither steered nor queued, a
+pre-turn refusal is `UNAVAILABLE`, and `DISPATCHED` is possible only after the
+started turn owns the correlated completion hook.
 
 The initial implementation uses the owning session for action turns. A dedicated
 monitor-action session may be evaluated later if transcript growth remains a
@@ -475,13 +501,20 @@ Test-first sequence:
 3. Prove no-change, retry, and terminal decisions never dispatch a turn.
 4. Prove one actionable fingerprint dispatches once across restart and concurrent
    timer callbacks.
-5. Prove stop records a durable outcome and the compatibility alias remains safe.
+5. Prove BUSY retries only the claimed wake, an accepted dispatch has a bounded
+   completion-evidence deadline, and unavailable delivery is terminal.
+6. Prove stale probe generations cannot apply and identity edits cannot break an
+   in-flight action's completion correlation.
+7. Prove stop records a durable outcome and legacy mutation routes cannot bypass
+   structured authorization or scheduling invariants.
 
 Exit criteria:
 
 - The agent can create the monitor with one tool call.
 - Server-side probes gate every subsequent model wake.
 - The public wake envelope is bounded, documented, and treated as automation.
+- Provider-controlled check identities never enter the wake prompt; it carries
+  status counts only.
 
 ### PR 5 — Truthful dashboard monitor experience
 

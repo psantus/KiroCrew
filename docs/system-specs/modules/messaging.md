@@ -124,7 +124,50 @@ therefore survives failure or cancellation during renderer finalization. A norma
 handler return, command intercept, or stream exception does not manufacture
 completion evidence. Callback failure is logged and cannot change the channel
 turn's output or error behavior. The hook is absent from ordinary inbound turns
-and legacy AutoNudge turns.
+and legacy AutoNudge turns. Directive consumption occurs
+before a later raw `EVENT_COMPLETE`, so an action that calls `monitor_stop` or
+the structured `autonudge_stop` alias first makes its monitor inactive with a
+durable `user_stop` outcome while retaining only the current wake correlation.
+The completion hook then charges and clears that claim exactly once. Without a
+raw completion the terminal record remains uncharged and cannot probe, re-arm,
+or redispatch.
+
+The structured monitor controller probes before entering any channel turn.
+No-change, record-only, provider-retry, and terminal decisions therefore call
+no messaging dispatcher and consume no model turn. For a newly actionable
+fingerprint it persists the in-flight claim first, then supplies one redacted,
+4,096-character-bounded `[Monitor wake]` envelope to the dashboard, Slack, or
+Discord adapter without legacy cycle decoration. Each adapter returns the same
+typed handoff: `DISPATCHED` starts the durable bounded completion-evidence
+deadline, `BUSY` retries the already-claimed wake without another probe or model
+turn, and `UNAVAILABLE` becomes a retained terminal outcome. A stream that ends
+without raw `EVENT_COMPLETE` remains dispatched until its evidence deadline; it
+never fabricates completion or immediately retries the same fingerprint.
+Discord decides the structured result at its own dispatch boundary, not from the
+scheduler's earlier advisory busy check: a concurrently busy session returns
+`BUSY` without steering or queueing the wake, a refusal before the turn returns
+`UNAVAILABLE`, and `DISPATCHED` is returned only after the claimed session has a
+started `TurnDriver` carrying the matching completion hook. After its advisory
+check, Discord takes the SessionManager's non-waiting semaphore lease before
+renderer setup, upload-policy lookup, typing, attachment work, or any other
+pre-turn await. If a user turn wins that authoritative claim boundary, the
+monitor returns `BUSY` immediately and creates no steer, queue entry, or
+completion evidence. The scheduler
+propagates that typed result unchanged.
+Slack rechecks the runtime inbound-channel policy before every structured wake,
+because the policy can become stricter after monitor creation. After its advisory
+busy check, Slack also takes the SessionManager's non-waiting semaphore claim; a
+user turn that wins that boundary returns `BUSY` without waiting, starting a turn,
+or creating completion evidence. A claimed Slack structured wake runs through
+the same `TurnDriver` directive consumer as ordinary channel turns, so an
+authenticated `monitor_update`, `monitor_stop`, or structured
+`autonudge_stop` result is applied to that Slack session before a later raw
+completion is accounted; legacy nudges retain their existing collector path.
+Discord applies
+the legacy 30-minute outer turn timeout only to legacy nudges; a structured wake
+that reaches `TurnDriver` is bounded by the controller's durable completion-
+evidence deadline, so a valid long-running turn is not cancelled and mislabeled
+as an unavailable target.
 
 ### Approval ladder
 

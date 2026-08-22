@@ -969,7 +969,9 @@ dependency and refuses an enabled wake request before either provider or persist
 work, so it cannot turn ambient GitHub authority into a model wake in this slice.
 
 The provider adapter's redaction is classified as inbound canonicalization rather
-than an egress surface.
+than an egress surface. The structured monitor controller is the corresponding
+registered redaction sink: it passes the complete bounded wake envelope through the
+exfiltration-URL and credential scanners before injecting it into an agent session.
 
 Sidebar status follows the same read-only boundary. `GET /api/chat/slots` and the WebSocket handshake schedule provider refreshes and opt into cached `ci`/`state` fields only for an exact configured-owner request, or for signed `local-app`/`local-startup` dashboard subjects when no owner is configured. Generic slot serialization omits those fields. `DashboardState` tracks owner-authorized WebSockets separately, sends generic slot updates to all authenticated clients, then overlays credential-backed status only to the owner subset. This prevents a cache populated by an owner request from being replayed to a non-owner or app-token caller. Review-thread cache removal, generation advancement, and stale in-flight detachment still complete after thread ownership validation and before mutation dispatch, so cancellation cannot preserve or repopulate pre-mutation data.
 

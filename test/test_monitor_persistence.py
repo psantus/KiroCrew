@@ -96,6 +96,20 @@ def test_structured_monitor_cadence_must_be_a_positive_integer() -> None:
         raise AssertionError(f"cadence_secs={cadence_secs!r} was accepted")
 
 
+def test_wake_count_defaults_to_zero_and_rejects_negative_values() -> None:
+    """Older records load as unused while malformed negative accounting fails closed."""
+    payload = {
+        "kind": "github_pull_request",
+        "target": "owner/repo#123",
+        "objective": "review_ready",
+        "created_ts": 1_000.0,
+    }
+
+    assert monitor_state_from_dict(payload).wake_count == 0
+    with pytest.raises(ValueError, match="wake_count"):
+        MonitorState(**payload, wake_count=-1)
+
+
 @pytest.mark.parametrize(
     ("payload", "field_name"),
     [
@@ -137,6 +151,7 @@ def test_monitor_state_survives_store_round_trip(tmp_path) -> None:
         last_fingerprint="failure-a",
         last_observed_at=1_200.0,
         last_wake_fingerprint="failure-a",
+        wake_count=3,
         agent_turns=2,
         input_tokens=12_000,
         output_tokens=3_000,
@@ -171,6 +186,7 @@ def test_monitor_state_survives_store_round_trip(tmp_path) -> None:
     assert restored.last_observation == {"head_revision": "abc123", "checks": "failing"}
     assert restored.last_fingerprint == "failure-a"
     assert restored.last_wake_fingerprint == "failure-a"
+    assert restored.wake_count == 3
     assert restored.budgets == MonitorBudgets(
         max_runtime_secs=7_200,
         max_agent_turns=4,

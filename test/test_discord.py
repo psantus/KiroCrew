@@ -21,11 +21,18 @@ from unittest import mock
 import pytest
 
 import kiro_crew.discord.transport_dispatch as td_mod
+from kiro_crew import session_directive
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_TEXT_CHUNK,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
+    AcpEvent,
+    TurnUsage,
 )
+from kiro_crew.autonudge import AutoNudgeService
+from kiro_crew.config import KiroCrewConfig
 from kiro_crew.discord.attachments import process_discord_attachments
 from kiro_crew.discord.client import (
     _INTENT_DIRECT_MESSAGES,
@@ -69,7 +76,15 @@ from kiro_crew.messaging.link import (
 from kiro_crew.messaging.queue_receipt import receipt_text as _receipt_text
 from kiro_crew.messaging.split import split_markdown_safe
 from kiro_crew.messaging.transport import InboundMessage
-from kiro_crew.session import _opt_out_key
+from kiro_crew.monitoring.completion import MonitorCompletionHook
+from kiro_crew.monitoring.models import (
+    MonitorActionCompletion,
+    MonitorActionDisposition,
+    MonitorBudgets,
+    MonitorDispatchResult,
+    MonitorOutcome,
+)
+from kiro_crew.session import SessionManager, _opt_out_key
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -239,6 +254,7 @@ class _Ev:
         self.tool_call_id = ""
         self.title = title
         self.context_usage_pct = 0.0
+        self.usage = None
 
 
 class FakeProvider:
@@ -337,7 +353,13 @@ class FakeSessions:
         return (key, origin) in self.paused_deliveries
 
     async def get_or_create(
-        self, key: str, *, agent: Any = None, channel_id: Any = None, model: Any = None
+        self,
+        key: str,
+        *,
+        agent: Any = None,
+        channel_id: Any = None,
+        model: Any = None,
+        wait_if_busy: bool = True,
     ) -> Any:
         self.last_agent = agent
         self.last_model = model
@@ -2158,6 +2180,286 @@ class TestDispatcher:
         await d.handle_message(self._msg("hello world"))
         assert "Answer: hello world" in (cli.final_text() or "")
         assert sess.successes and sess.released
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_busy_at_dispatch_boundary_is_not_steered_or_queued(
+        self,
+    ) -> None:
+        d, cli, sess = _dispatcher({"u1"})
+        sess._busy = True
+        completions: list[MonitorActionCompletion] = []
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=MonitorCompletionHook("mon-1", "failure-a", _complete),
+        )
+
+        assert result is MonitorDispatchResult.BUSY
+        assert sess._gp.steered == []
+        assert sess.queued == []
+        assert cli.reactions == []
+        assert completions == []
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_losing_race_at_session_claim_returns_busy(
+        self,
+    ) -> None:
+        """A user turn winning after the advisory check must not make the wake wait."""
+
+        class _LiveProvider(FakeProvider):
+            async def start(self) -> None:
+                return None
+
+            async def shutdown(self) -> None:
+                return None
+
+            def is_process_alive(self) -> bool:
+                return True
+
+            def is_alive(self) -> bool:
+                return True
+
+            def context_usage_pct(self) -> float:
+                return 0.0
+
+        provider = _LiveProvider()
+
+        def _factory(*_args: Any, **_kwargs: Any) -> _LiveProvider:
+            return provider
+
+        manager = SessionManager(KiroCrewConfig(), provider_factory=_factory)
+        boundary_reached = asyncio.Event()
+        resume_monitor = asyncio.Event()
+
+        class _PausingSessions:
+            def __init__(self) -> None:
+                self.pause_next_claim = True
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(manager, name)
+
+            async def get_or_create(self, *args: Any, **kwargs: Any) -> Any:
+                if self.pause_next_claim:
+                    self.pause_next_claim = False
+                    boundary_reached.set()
+                    await resume_monitor.wait()
+                return await manager.get_or_create(*args, **kwargs)
+
+        sessions = _PausingSessions()
+        dispatcher = DiscordDispatcher(
+            sessions=sessions,  # type: ignore[arg-type]
+            ctx_builder=FakeCtx(),  # type: ignore[arg-type]
+            cfg=_cfg(),
+            allowed_user_ids={"u1"},
+        )
+        client = FakeClient()
+        dispatcher.client = client  # type: ignore[assignment]
+        key = dispatcher._session_key("u1")
+        await manager.get_or_create(key)
+        manager.release(key)
+        completions: list[MonitorActionCompletion] = []
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        monitor_task = asyncio.create_task(
+            dispatcher.handle_message(
+                self._msg("[Monitor wake]"),
+                interpret_commands=False,
+                monitor_completion=MonitorCompletionHook("mon-1", "failure-a", _complete),
+            )
+        )
+        try:
+            await boundary_reached.wait()
+            await manager.get_or_create(key)  # A user turn wins the actual semaphore.
+            resume_monitor.set()
+
+            # Fixed scheduler turns keep the assertion deterministic: the
+            # non-waiting claim completes immediately, while the old blocking
+            # path remains parked until the user lease is released in finally.
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if monitor_task.done():
+                    break
+
+            assert monitor_task.done()
+            assert monitor_task.result() is MonitorDispatchResult.BUSY
+            assert provider.steered == []
+            assert manager.dequeue(key) is None
+            assert completions == []
+        finally:
+            resume_monitor.set()
+            if manager.is_busy(key):
+                manager.release(key)
+            if not monitor_task.done():
+                monitor_task.cancel()
+            await asyncio.gather(monitor_task, return_exceptions=True)
+            await manager.close_all()
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_pre_turn_refusal_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        completions: list[MonitorActionCompletion] = []
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        async def _denied(_channel_type: str) -> bool:
+            return False
+
+        monkeypatch.setattr(
+            "kiro_crew.discord.transport_dispatch.channel_inbound_permitted", _denied
+        )
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=MonitorCompletionHook("mon-1", "failure-a", _complete),
+        )
+
+        assert result is MonitorDispatchResult.UNAVAILABLE
+        assert sess.released == []
+        assert sess.failures == []
+        assert completions == []
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_cold_start_failure_is_unavailable(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"}, raise_on_get=True)
+        completions: list[MonitorActionCompletion] = []
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=MonitorCompletionHook("mon-1", "failure-a", _complete),
+        )
+
+        assert result is MonitorDispatchResult.UNAVAILABLE
+        assert sess.released == []
+        assert sess.failures == []
+        assert completions == []
+
+    @pytest.mark.asyncio
+    async def test_monitor_wake_dispatches_with_correlated_raw_completion(self) -> None:
+        d, _cli, sess = _dispatcher({"u1"})
+        completions: list[MonitorActionCompletion] = []
+
+        async def _complete(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=MonitorCompletionHook("mon-1", "failure-a", _complete),
+        )
+
+        assert result is MonitorDispatchResult.DISPATCHED
+        assert len(completions) == 1
+        assert completions[0].monitor_id == "mon-1"
+        assert completions[0].fingerprint == "failure-a"
+        assert completions[0].disposition is MonitorActionDisposition.SUCCESS
+        assert sess.successes and sess.released
+
+    @pytest.mark.asyncio
+    async def test_monitor_stop_directive_before_raw_completion_keeps_accounting(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The stop tool result must not erase the wake claimed by this turn."""
+        d, _cli, sess = _dispatcher({"u1"})
+        session_key = d._session_key("u1")
+        service = AutoNudgeService(base_dir=tmp_path)
+        loop = await service.add_monitor(
+            slot_key=session_key,
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            cadence_secs=60,
+            budgets=MonitorBudgets(),
+            now=100.0,
+        )
+        assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=120.0)
+
+        class _DirectiveProvider(FakeProvider):
+            async def stream(self, message: str) -> Any:
+                yield AcpEvent(
+                    kind=EVENT_TOOL_CALL,
+                    tool_call_id="stop-1",
+                    title="autonudge_stop",
+                    tool_name="autonudge_stop",
+                    mcp_server_name=session_directive.CORE_MCP_SERVER,
+                )
+                yield AcpEvent(
+                    kind=EVENT_TOOL_RESULT,
+                    tool_call_id="stop-1",
+                    tool_output=session_directive.encode(
+                        "autonudge_stop",
+                        {"reason": "objective complete"},
+                        "Monitor stop requested.",
+                    ),
+                    tool_final=True,
+                )
+                yield AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="end_turn",
+                    usage=TurnUsage(input_tokens=11, output_tokens=7),
+                )
+
+        provider = _DirectiveProvider()
+
+        async def _get_or_create(*args: Any, **kwargs: Any) -> Any:
+            return provider, False, False
+
+        sess.get_or_create = _get_or_create  # type: ignore[method-assign]
+        monkeypatch.setattr("kiro_crew.autonudge.get_instance", lambda: service)
+        monkeypatch.setattr(
+            "kiro_crew.autonudge_authz.sel",
+            lambda: SimpleNamespace(log_tool_invocation=lambda **_kwargs: None),
+        )
+        completion = MonitorCompletionHook(
+            loop.id,
+            "failure-a",
+            service.record_monitor_turn_completion,
+        )
+
+        result = await d.handle_message(
+            self._msg("[Monitor wake]"),
+            interpret_commands=False,
+            monitor_completion=completion,
+        )
+
+        assert result is MonitorDispatchResult.DISPATCHED
+        assert loop.monitor is not None
+        assert loop.monitor.outcome is MonitorOutcome.USER_STOP
+        assert not loop.active
+        assert not loop.monitor.wake_in_flight
+        assert loop.monitor.agent_turns == 1
+        assert loop.monitor.wake_count == 1
+        assert loop.monitor.input_tokens == 11
+        assert loop.monitor.output_tokens == 7
+        assert loop.monitor.last_completion_fingerprint == "failure-a"
+        assert loop.next_due_ts == 0.0
+
+        # A duplicate completion frame/callback cannot charge the retained
+        # terminal record a second time.
+        await completion.complete(
+            MonitorActionDisposition.SUCCESS,
+            TurnUsage(input_tokens=100, output_tokens=200),
+            completed_ts=140.0,
+        )
+        assert loop.monitor.agent_turns == 1
+        assert loop.monitor.wake_count == 1
+        assert loop.monitor.input_tokens == 11
+        assert loop.monitor.output_tokens == 7
+        service.stop()
 
     @pytest.mark.asyncio
     async def test_cold_start_failure_releases_nothing_but_closes_renderer(

@@ -21,12 +21,63 @@ DEFAULT_MONITOR_TOKENS = 250_000
 DEFAULT_MONITOR_PROVIDER_ERRORS = 3
 DEFAULT_MONITOR_CADENCE_SECS = 300
 MONITOR_STOP_INVALID_RECORD = "invalid_monitor_record"
+MIN_MONITOR_CADENCE_SECS = 15
+MAX_MONITOR_CADENCE_SECS = 86_400
+MAX_MONITOR_RUNTIME_SECS = 604_800
+MAX_MONITOR_AGENT_TURNS = 8
+MAX_MONITOR_TOKENS = 1_000_000
+MAX_MONITOR_PROVIDER_ERRORS = 20
+MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS = 1_000
+MAX_MONITOR_CHECK_NAMES = 8
+# The normal turn ceiling is two hours. One extra minute lets the raw completion
+# callback win the timeout race while keeping missing evidence restart-durable
+# and bounded.
+MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS = 7_260
+MONITOR_BUSY_RETRY_SECS = 15
 MONITOR_STOP_RUNTIME_BUDGET = "runtime_budget"
 MONITOR_STOP_AGENT_TURN_BUDGET = "agent_turn_budget"
 MONITOR_STOP_TOKEN_BUDGET = "token_budget"
 MONITOR_STOP_APPROVAL_STALL = "approval_stall"
 MONITOR_STOP_COMPLETION_UNAVAILABLE = "completion_evidence_unavailable"
 MONITOR_STOP_UNSUPPORTED_VERSION = "unsupported_monitor_version"
+MONITOR_STOP_USER = "user_stop"
+MONITOR_STOP_SESSION_UNAVAILABLE = "session_unavailable"
+MONITOR_STOP_SESSION_CLOSE = "session_close"
+MONITOR_PUBLIC_FIELDS = (
+    "version",
+    "config_generation",
+    "kind",
+    "target",
+    "objective",
+    "budgets",
+    "cadence_secs",
+    "wake_instructions",
+    "last_observation",
+    "last_fingerprint",
+    "last_observed_at",
+    "last_wake_fingerprint",
+    "wake_in_flight",
+    "wake_delivery",
+    "wake_count",
+    "completion_evidence_deadline",
+    "last_completion_fingerprint",
+    "last_completion_disposition",
+    "last_completed_at",
+    "token_usage_known",
+    "agent_turns",
+    "input_tokens",
+    "output_tokens",
+    "probe_count",
+    "provider_error_count",
+    "consecutive_provider_errors",
+    "last_probe_at",
+    "last_decision",
+    "last_provider_error",
+    "next_probe_at",
+    "outcome",
+    "stopped_reason",
+    "stopped_at",
+)
 
 
 class MonitorDecision(str, Enum):
@@ -80,6 +131,14 @@ class MonitorActionDisposition(str, Enum):
     FAILURE = "failure"
     CANCELLATION = "cancellation"
     APPROVAL_STALL = "approval_stall"
+
+
+class MonitorDispatchResult(str, Enum):
+    """Typed result of handing one claimed wake to its owning session."""
+
+    DISPATCHED = "dispatched"
+    BUSY = "busy"
+    UNAVAILABLE = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -184,13 +243,19 @@ class MonitorState:
     objective: str
     created_ts: float
     version: int = MONITOR_STATE_VERSION
+    config_generation: int = 1
     budgets: MonitorBudgets = field(default_factory=MonitorBudgets)
     cadence_secs: int = DEFAULT_MONITOR_CADENCE_SECS
+    wake_instructions: str = ""
     last_observation: dict[str, object] = field(default_factory=dict)
     last_fingerprint: str = ""
     last_observed_at: float = 0.0
     last_wake_fingerprint: str = ""
     wake_in_flight: bool = False
+    wake_delivery: MonitorDispatchResult | None = None
+    wake_count: int = 0
+    completion_evidence_deadline: float = 0.0
+    last_wake_reason_code: str = ""
     last_completion_fingerprint: str = ""
     last_completion_disposition: MonitorActionDisposition | None = None
     last_completed_at: float = 0.0
@@ -218,10 +283,17 @@ class MonitorState:
                 raise ValueError(f"{name} must be a non-empty string")
         if isinstance(self.version, bool) or not isinstance(self.version, int) or self.version <= 0:
             raise ValueError("version must be a positive integer")
+        if (
+            isinstance(self.config_generation, bool)
+            or not isinstance(self.config_generation, int)
+            or self.config_generation <= 0
+        ):
+            raise ValueError("config_generation must be a positive integer")
         for name in (
             "created_ts",
             "last_observed_at",
             "last_completed_at",
+            "completion_evidence_deadline",
             "last_probe_at",
             "next_probe_at",
             "stopped_at",
@@ -235,6 +307,7 @@ class MonitorState:
             ):
                 raise ValueError(f"{name} must be a finite non-negative number")
         for name in (
+            "wake_count",
             "agent_turns",
             "input_tokens",
             "output_tokens",
@@ -256,17 +329,24 @@ class MonitorState:
         if not isinstance(self.last_observation, dict):
             raise ValueError("last_observation must be an object")
         _validate_strict_json_object("last_observation", self.last_observation)
+        if not isinstance(self.wake_instructions, str):
+            raise ValueError("wake_instructions must be a string")
         if any(
             not isinstance(value, str)
             for value in (
                 self.last_fingerprint,
                 self.last_wake_fingerprint,
                 self.last_completion_fingerprint,
+                self.last_wake_reason_code,
             )
         ):
             raise ValueError("monitor fingerprints must be strings")
         if not isinstance(self.wake_in_flight, bool):
             raise ValueError("wake_in_flight must be a boolean")
+        if self.wake_delivery is not None and not isinstance(
+            self.wake_delivery, MonitorDispatchResult
+        ):
+            raise ValueError("wake_delivery must be a MonitorDispatchResult")
         if self.last_completion_disposition is not None and not isinstance(
             self.last_completion_disposition, MonitorActionDisposition
         ):
@@ -352,6 +432,9 @@ def monitor_state_from_dict(raw: object) -> MonitorState:
     disposition = values.get("last_completion_disposition")
     if disposition is not None:
         values["last_completion_disposition"] = MonitorActionDisposition(disposition)
+    delivery = values.get("wake_delivery")
+    if delivery is not None:
+        values["wake_delivery"] = MonitorDispatchResult(delivery)
     decision = values.get("last_decision")
     if decision is not None:
         values["last_decision"] = MonitorDecision(decision)
@@ -399,4 +482,11 @@ def monitor_state_to_dict(state: MonitorState) -> dict[str, object]:
     if isinstance(extra, dict):
         for key, value in extra.items():
             payload.setdefault(key, value)
+    return payload
+
+
+def monitor_state_public_dict(state: MonitorState) -> dict[str, object]:
+    """Return the stable inspect/dashboard fields without persistence internals."""
+    payload = {key: deepcopy(getattr(state, key)) for key in MONITOR_PUBLIC_FIELDS}
+    payload["budgets"] = asdict(state.budgets)
     return payload

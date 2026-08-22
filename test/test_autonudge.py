@@ -11,9 +11,9 @@ import pytest
 
 from kiro_crew import autonudge as _an
 from kiro_crew import autonudge_authz as _autonudge_mod
-from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
+from kiro_crew.autonudge import AutoNudgeService, MonitorUpdateConflict, NudgeLoop
 from kiro_crew.dashboard.handlers.autonudge import render_nudge_message
-from kiro_crew.monitoring.models import MonitorOutcome, MonitorState
+from kiro_crew.monitoring.models import MonitorBudgets, MonitorOutcome, MonitorState
 
 
 @pytest.fixture(autouse=True)
@@ -586,6 +586,36 @@ async def test_one_loop_per_slot_replaces(svc):
     all_loops = svc.list_all()
     assert len(all_loops) == 1
     assert all_loops[0].message == "second"
+
+
+@pytest.mark.asyncio
+async def test_add_monitor_refuses_to_replace_an_inflight_wake(svc):
+    await svc.start()
+    existing = await svc.add_monitor(
+        slot_key="chat-1-123",
+        kind="github_pull_request",
+        target="owner/repo#123",
+        objective="review_ready",
+        cadence_secs=60,
+        budgets=MonitorBudgets(),
+    )
+    assert existing.monitor is not None
+    existing.monitor.wake_in_flight = True
+    existing.monitor.last_wake_fingerprint = "actionable-1"
+
+    with pytest.raises(MonitorUpdateConflict, match="wake is in flight"):
+        await svc.add_monitor(
+            slot_key="chat-1-123",
+            kind="github_pull_request",
+            target="owner/repo#456",
+            objective="review_ready",
+            cadence_secs=60,
+            budgets=MonitorBudgets(),
+        )
+
+    assert svc.get_by_slot("chat-1-123") is existing
+    assert existing.monitor.wake_in_flight
+    assert existing.monitor.last_wake_fingerprint == "actionable-1"
 
 
 @pytest.mark.asyncio

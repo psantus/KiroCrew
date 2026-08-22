@@ -18,11 +18,13 @@ from typing import Any
 import pytest
 
 from kiro_crew import autonudge_authz
+from kiro_crew.autonudge import MonitorUpdateConflict
 from kiro_crew.autonudge_authz import (
     MAX_RUNTIME_SECS_CEILING,
     authorize_and_add_nudge,
     authorize_and_update_nudge,
 )
+from kiro_crew.monitoring.models import MonitorState
 
 pytestmark = pytest.mark.asyncio
 
@@ -358,6 +360,32 @@ async def test_add_audits_then_reraises_a_service_failure(audits: list[dict]) ->
     outcomes = [a["outcome"] for a in audits]
     assert outcomes == ["invoked", "error"]  # audited BEFORE the attempt, then the failure
     assert "svc.add failed: OSError" in audits[-1]["error"]
+
+
+async def test_add_monitor_returns_conflict_when_a_wake_is_inflight(
+    audits: list[dict],
+) -> None:
+    class ConflictingSvc:
+        async def add_monitor(self, **kw: Any) -> Any:
+            raise MonitorUpdateConflict("existing monitor wake is in flight")
+
+    loop, error, status = await authorize_and_add_nudge(
+        svc=ConflictingSvc(),
+        state=_state(slots={"chat-1-1": SimpleNamespace(workspace="default")}),
+        slot_key="chat-1-1",
+        message="watch",
+        source="dashboard",
+        monitor=MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#456",
+            objective="review_ready",
+            created_ts=1_000.0,
+        ),
+    )
+
+    assert loop is None and status == 409
+    assert error == "existing monitor wake is in flight"
+    assert [event["outcome"] for event in audits] == ["invoked", "denied"]
 
 
 # ── update(): the remaining payload-shape denials ──

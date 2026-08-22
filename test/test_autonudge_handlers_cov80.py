@@ -21,8 +21,9 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
-from kiro_crew.autonudge import NudgeLoop
+from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
 from kiro_crew.dashboard.handlers import autonudge as h
+from kiro_crew.monitoring.models import MonitorState
 
 
 class _FakeSvc:
@@ -46,6 +47,17 @@ def _loop(loop_id: str = "lp-1", slot_key: str = "chat-1-111") -> NudgeLoop:
     return NudgeLoop(id=loop_id, slot_key=slot_key, message="keep checking", idle_secs=300)
 
 
+def _monitor_loop(loop_id: str = "mon-1", slot_key: str = "chat-1-111") -> NudgeLoop:
+    loop = _loop(loop_id, slot_key)
+    loop.monitor = MonitorState(
+        kind="github_pull_request",
+        target="https://github.com/acme/widgets/pull/7",
+        objective="review_ready",
+        created_ts=1.0,
+    )
+    return loop
+
+
 @pytest.fixture()
 def sel_mock(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Replace the audit sink so nothing is written to a real event log."""
@@ -66,10 +78,17 @@ def _mk(
     match: dict[str, str] | None = None,
     body: Any = ...,
     state: Any = None,
+    headers: dict[str, str] | None = None,
 ) -> web.Request:
     app = web.Application()
     app["state"] = state if state is not None else MagicMock()
-    req = make_mocked_request(method, path, app=app, match_info=match or {})
+    req = make_mocked_request(
+        method,
+        path,
+        app=app,
+        match_info=match or {},
+        headers=headers,
+    )
     if body is not ...:
         if body is None:
             req.json = AsyncMock(side_effect=ValueError("bad json"))  # type: ignore[method-assign]
@@ -85,6 +104,190 @@ def _body(response: web.StreamResponse) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
+# --- /api/monitors ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_monitor_read_requires_and_uses_authenticated_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _monitor_loop(slot_key="chat-1-111")
+    assert loop.monitor is not None
+    loop.monitor.wake_count = 3
+    _svc(monkeypatch, _FakeSvc([loop]))
+
+    missing = await h.api_session_monitor_get(_mk("GET", "/api/autonudge/session-monitor"))
+    assert missing.status == 401
+    request = _mk(
+        "GET",
+        "/api/autonudge/session-monitor",
+        headers={"X-Session-Key": "dashboard:chat-1-111"},
+    )
+    payload = _body(await h.api_session_monitor_get(request))
+
+    assert payload["monitor_id"] == loop.id
+    assert payload["monitor"]["target"] == "https://github.com/acme/widgets/pull/7"
+    assert payload["monitor"]["wake_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_monitor_list_excludes_persistence_only_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _monitor_loop()
+    assert loop.monitor is not None
+    loop.monitor.extra_fields["raw_provider_payload"] = "must-not-escape"
+    loop.monitor._raw_payload = {"raw_provider_payload": "must-not-escape"}
+    _svc(monkeypatch, _FakeSvc([loop]))
+
+    payload = _body(await h.api_monitors_list(_mk("GET", "/api/monitors")))
+
+    assert "must-not-escape" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_monitor_create_uses_bounded_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    svc = _svc(monkeypatch, _FakeSvc())
+    authorize = AsyncMock(return_value=(_monitor_loop("new-mon"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+    request = _mk(
+        "POST",
+        "/api/monitors",
+        body={
+            "slot_key": "chat-1-111",
+            "target": "https://github.com/acme/widgets/pull/7",
+        },
+    )
+    response = await h.api_monitor_create(request)
+    assert response.status == 200
+    kwargs = authorize.await_args.kwargs
+    assert kwargs["svc"] is svc
+    assert kwargs["monitor"].budgets.max_runtime_secs == 14_400
+    assert kwargs["monitor"].budgets.max_agent_turns == 8
+    assert kwargs["monitor"].budgets.max_tokens == 250_000
+    assert kwargs["monitor"].budgets.max_provider_errors == 3
+
+
+@pytest.mark.asyncio
+async def test_monitor_create_rejects_unlimited_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    request = _mk(
+        "POST",
+        "/api/monitors",
+        body={
+            "slot_key": "chat-1-111",
+            "target": "https://github.com/acme/widgets/pull/7",
+            "max_runtime_secs": 0,
+        },
+    )
+    response = await h.api_monitor_create(request)
+    assert response.status == 400
+    assert _body(response)["code"] == "invalid_monitor"
+
+
+@pytest.mark.asyncio
+async def test_monitor_stop_retains_authoritative_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    loop = _monitor_loop()
+    _svc(monkeypatch, _FakeSvc([loop]))
+    stop = AsyncMock(return_value=(loop, None, 200))
+    monkeypatch.setattr(h, "authorize_and_stop_monitor", stop)
+    request = _mk("POST", "/api/monitors/mon-1/stop", match={"monitor_id": "mon-1"}, body={})
+    payload = _body(await h.api_monitor_stop(request))
+    assert payload["monitor"]["id"] == "mon-1"
+    stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_monitor_restart_rejects_a_future_version_without_rewriting_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    future_monitor = {
+        "version": 99,
+        "kind": "github_pull_request",
+        "target": "owner/repo#123",
+        "objective": "review_ready",
+        "created_ts": 1_000.0,
+        "future_policy": {"wake_every_time": True},
+    }
+    store = {
+        "version": 1,
+        "loops": [
+            {
+                "id": "future01",
+                "slot_key": "chat-1-123",
+                "message": "future instructions",
+                "idle_secs": 300,
+                "active": True,
+                "monitor": future_monitor,
+            }
+        ],
+    }
+    store_path = tmp_path / "autonudge.json"
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+    service = AutoNudgeService(base_dir=tmp_path)
+    service._load()
+    before = store_path.read_bytes()
+    authorize = AsyncMock(return_value=(service._loops["future01"], None, 200))
+    monkeypatch.setattr(h, "_autonudge_get", lambda: service)
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+    request = _mk(
+        "POST",
+        "/api/monitors/future01/restart",
+        match={"monitor_id": "future01"},
+    )
+
+    response = await h.api_monitor_restart(request)
+
+    assert response.status == 409
+    assert _body(response)["code"] == "unsupported_monitor_version"
+    authorize.assert_not_awaited()
+    assert store_path.read_bytes() == before
+    assert service._serialize_state()["loops"][0]["monitor"] == future_monitor
+
+
+@pytest.mark.asyncio
+async def test_monitor_update_sends_only_explicit_patch_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _monitor_loop()
+    _svc(monkeypatch, _FakeSvc([loop]))
+    update = AsyncMock(return_value=(loop, None, 200))
+    monkeypatch.setattr(h, "authorize_and_update_monitor", update)
+    request = _mk(
+        "PATCH",
+        "/api/monitors/mon-1",
+        match={"monitor_id": "mon-1"},
+        body={"wake_instructions": "Check the failing jobs."},
+    )
+
+    response = await h.api_monitor_update(request)
+
+    assert response.status == 200
+    assert update.await_args.kwargs["patch"] == {"wake_instructions": "Check the failing jobs."}
+
+
+@pytest.mark.asyncio
+async def test_legacy_patch_rejects_a_structured_monitor_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _monitor_loop()
+    _svc(monkeypatch, _FakeSvc([loop]))
+    legacy_update = AsyncMock()
+    monkeypatch.setattr(h, "authorize_and_update_nudge", legacy_update)
+    request = _mk(
+        "PATCH",
+        "/api/autonudge/mon-1",
+        match={"loop_id": "mon-1"},
+        body={"message": "legacy overwrite", "active": False},
+    )
+
+    response = await h.api_autonudge_update(request)
+
+    assert response.status == 409
+    assert _body(response)["code"] == "structured_monitor_requires_monitor_api"
+    legacy_update.assert_not_awaited()
+
+
 # --- GET /api/autonudge ------------------------------------------------------
 
 
@@ -97,13 +300,21 @@ async def test_list_reports_disabled_when_service_absent(monkeypatch: pytest.Mon
 
 @pytest.mark.asyncio
 async def test_list_serializes_every_loop(monkeypatch: pytest.MonkeyPatch) -> None:
-    _svc(monkeypatch, _FakeSvc([_loop("lp-1"), _loop("lp-2", "chat-2-222")]))
+    legacy = _loop("lp-1")
+    structured = _monitor_loop("mon-1", "chat-2-222")
+    assert structured.monitor is not None
+    structured.monitor.extra_fields["secret"] = "must-not-escape"
+    structured.monitor._raw_payload = {"secret": "must-not-escape"}
+    _svc(monkeypatch, _FakeSvc([legacy, structured]))
     payload = _body(await h.api_autonudge_list(_mk("GET", "/api/autonudge")))
     assert payload["enabled"] is True
-    assert [lp["id"] for lp in payload["loops"]] == ["lp-1", "lp-2"]
-    # asdict() round-trip, not a repr: the full dataclass shape reaches the client.
+    assert [lp["id"] for lp in payload["loops"]] == ["lp-1", "mon-1"]
+    # The legacy dataclass fields still round-trip as JSON, without the new marker.
     assert payload["loops"][0]["idle_secs"] == 300
     assert payload["loops"][0]["slot_key"] == "chat-1-111"
+    assert "monitor" not in payload["loops"][0]
+    assert payload["loops"][1]["monitor"]["target"].endswith("/pull/7")
+    assert "must-not-escape" not in json.dumps(payload)
 
 
 # --- GET /api/autonudge/{slot_key} -------------------------------------------
@@ -123,6 +334,24 @@ async def test_get_returns_the_loop_bound_to_the_slot(monkeypatch: pytest.Monkey
     payload = _body(await h.api_autonudge_get(request))
     assert payload["enabled"] is True
     assert payload["loop"]["id"] == "lp-9"
+    assert "monitor" not in payload["loop"]
+
+
+@pytest.mark.asyncio
+async def test_get_projects_a_structured_monitor_without_persistence_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _monitor_loop("mon-9", "chat-7-777")
+    assert loop.monitor is not None
+    loop.monitor.extra_fields["secret"] = "must-not-escape"
+    loop.monitor._raw_payload = {"secret": "must-not-escape"}
+    _svc(monkeypatch, _FakeSvc([loop]))
+    request = _mk("GET", "/api/autonudge/chat-7-777", match={"slot_key": "chat-7-777"})
+
+    payload = _body(await h.api_autonudge_get(request))
+
+    assert payload["loop"]["monitor"]["target"].endswith("/pull/7")
+    assert "must-not-escape" not in json.dumps(payload)
 
 
 @pytest.mark.asyncio
@@ -295,6 +524,31 @@ async def test_delete_removes_and_audits_the_owning_slot(
     assert kwargs["tool_name"] == "autonudge_delete"
     assert kwargs["outcome"] == "success"
     assert kwargs["metadata"]["loop_id"] == "lp-1"
+
+
+@pytest.mark.asyncio
+async def test_legacy_delete_of_structured_monitor_audits_before_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _monitor_loop()
+    svc = _svc(monkeypatch, _FakeSvc([loop]))
+    stop = AsyncMock(return_value=(None, "audit log unavailable — monitor not stopped", 503))
+    monkeypatch.setattr(h, "authorize_and_stop_monitor", stop)
+    request = _mk("DELETE", "/api/autonudge/mon-1", match={"loop_id": "mon-1"})
+
+    response = await h.api_autonudge_delete(request)
+
+    assert response.status == 503
+    assert _body(response)["code"] == "monitor_stop_denied"
+    assert svc.list_all() == [loop]
+    assert svc.removed == []
+    stop.assert_awaited_once_with(
+        svc=svc,
+        loop_id="mon-1",
+        session_key="chat-1-111",
+        source="dashboard",
+        caller="",
+    )
 
 
 @pytest.mark.asyncio

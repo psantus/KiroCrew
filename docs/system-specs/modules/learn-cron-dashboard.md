@@ -809,9 +809,10 @@ behavior.
 controller record for probe-first monitors. Absence is the durable compatibility
 marker for a legacy prompt loop, and serialization omits the absent field so an
 unrelated save does not eagerly migrate old records. The record owns target and
-objective identity, canonical observation and wake fingerprints, in-flight
-state, provider-error streak, completed agent-turn and token totals, probe
-deadline, and terminal outcome. Load reconstructs the typed record; a terminal
+objective identity and configuration generation, canonical observation and wake
+fingerprints, typed in-flight delivery and completion-evidence deadline,
+provider-error streak, completed agent-turn and token totals, probe deadline, and
+terminal outcome. Load reconstructs the typed record; a terminal
 record with a contradictory active loop is deactivated. An unsupported monitor
 version is also deactivated, marked blocked with
 `unsupported_monitor_version`, and retained for inspection rather than executed
@@ -827,13 +828,16 @@ the legacy loop default remains 60 seconds. This substrate has no delivery
 dispatcher: loading, generic updating, arming, or a pre-existing timer all fail
 closed without a model turn until the probe controller is wired. It does expose
 a dormant completed-turn controller seam. An actionable fingerprint is persisted
-in-flight before dispatch; dispatch failure clears that claim without spend; a
+in-flight before dispatch; unavailable delivery clears that claim without spend,
+while busy delivery retries the claim within its runtime bound; a
 correlated completion charges one agent turn exactly once, adds only reported
 non-negative token counts, and records token usage as unknown when authoritative
 counts are unavailable. Duplicate, removed, replaced, legacy, and mismatched
-callbacks are no-ops. Recovery of persisted in-flight state deactivates the
-record with `completion_evidence_unavailable` while retaining the acknowledged
-fingerprint, so restart cannot immediately duplicate the wake. Completion stops
+callbacks are no-ops. Recovery resumes an accepted in-flight wake toward its
+persisted completion-evidence deadline and a BUSY claim toward its persisted retry
+deadline. A legacy claim with neither typed delivery nor an evidence deadline
+deactivates with `completion_evidence_unavailable` while retaining the
+acknowledged fingerprint, so restart cannot duplicate the wake. Completion stops
 on the first exhausted runtime, turn, or token bound (in that precedence), and
 the completed-turn bound is validated against the universal eight-turn ceiling
 when constructed or loaded. Approval-stall completion is terminal and budget exhaustion takes
@@ -1399,6 +1403,115 @@ The Agents page context window section shows per-session info:
 - Agent name (purple) for custom agents, hidden for kirocrew
 - Model read from agent config file when `_model` is "auto" (custom agents)
 - `agent` field in API response from `GET /api/sessions/context`
+
+### Structured monitors
+
+Structured monitors share AutoNudge's one-record-per-session store and timer
+ownership but never enter its legacy prompt-cycle accounting. A record is
+identified positively by `NudgeLoop.monitor is not None`. `NudgeLoop.next_due_ts`
+is the scheduler authority and `MonitorState.next_probe_at` is its inspection
+mirror; every transition writes them together under the service lock before the
+off-loop fsync. Active version-1 records re-arm toward that deadline after a
+restart. An accepted in-flight wake persists its finite completion-evidence
+deadline and resumes that deadline after restart; an older claim with no deadline
+is retained, inactive, and blocked. A persisted `BUSY` claim intentionally has no
+completion deadline and resumes its existing `next_due_ts` retry after restart.
+Future versions also fail closed.
+The gateway imports the controller and provider adapters only after the
+AutoNudge feature gate accepts initialization, so disabling AutoNudge keeps
+provider clients off the gateway boot path. Dashboard route registration keeps
+only monitor models at module scope; the pull-request target parser loads when a
+monitor mutation route is actually invoked, not while the disabled gateway
+assembles its HTTP application.
+
+`MonitorController` currently accepts only a public GitHub pull request with the
+`review_ready` objective. The typed provider probe runs off the event loop. The
+controller persists canonical allowlisted facts, fingerprint, error counters,
+decision, and next deadline before returning. `NO_CHANGE`, `RECORD_ONLY`,
+`RETRY_PROVIDER`, and all terminal decisions dispatch zero agent turns. Retryable
+provider errors use bounded exponential backoff; terminal provider, success,
+blocked, and budget outcomes remain inspectable with stable reason codes.
+Known actionable GitHub facts (failed checks, requested changes, unresolved
+review threads, and merge blockers) take precedence over simultaneous pending or
+unknown facts. For an actionable classification its deduplication fingerprint
+contains the known blockers but excludes unrelated pending/unknown check churn;
+the full allowlisted canonical observation remains available for inspection.
+
+A new actionable fingerprint atomically records `last_wake_fingerprint` and
+`wake_in_flight=True` before delivery. Concurrent or restarted ticks cannot
+dispatch it twice. Dashboard, Slack, and Discord receive the same ephemeral,
+redacted `[Monitor wake]` envelope; it is capped at 4,096 characters and is
+never stored as `loop.message`. Check results enter that agent-facing envelope as
+status counts only; provider-controlled check identities remain available to the
+human inspection surface but never become prompt text. Only Task 2's raw
+provider-completion hook clears
+the claim and charges the action-turn/token budgets. Dispatch or stream return is
+not completion evidence. A raw completion received before a transport timeout
+remains authoritative and is charged once even when the enclosing stream later
+times out. A pre-turn delivery failure retires the record as
+target unavailable without charging a turn or immediately retrying the same
+fingerprint. Every adapter returns `DISPATCHED`, `BUSY`, or `UNAVAILABLE`.
+`BUSY` persists a short retry for the existing claim without probing or entering
+the model; `DISPATCHED` persists a bounded completion-evidence deadline; only
+`UNAVAILABLE` is terminal. Expiry without a raw completion event retains the
+terminal `completion_evidence_unavailable` outcome and clears the claim without
+charging or redispatching it. Cadence changes update the policy used for the next
+future probe but never replace or re-arm a current BUSY retry or completion-
+evidence deadline, so repeated edits cannot postpone expiry or runtime checks.
+The durable public `wake_count` increments once on the first `DISPATCHED`
+transition, or on raw completion when it wins the handoff race. BUSY attempts and
+retries, restart recovery, duplicate reports, and `UNAVAILABLE` do not increment
+it.
+
+Session close is a retained terminal transition, but history persistence owns
+whether that close commits. Retirement disarms the timer while preserving any
+accepted wake claim, delivery marker, and completion-evidence deadline. If
+history persistence fails, rollback restores that exact evidence deadline (or a
+short same-claim retry before dispatch) rather than starting a fresh cadence;
+the raw completion can therefore still account for the accepted turn exactly
+once.
+
+The stateless MCP surface is `monitor_watch`, the extended `monitor_update`,
+`monitor_inspect`, and `monitor_stop`. Create/update/stop directives carry no
+session or loop identifier and are applied to the consumer's authoritative
+binding after the same dashboard/Slack/Discord authorization and critical SEL
+audit as legacy loops. A structured create or update that is disabled,
+unsupported, refused by authorization, or otherwise not applied records a
+`denied` directive outcome rather than a successful application.
+`monitor_inspect` alone is a direct read: it requires a
+strict authenticated session key and reports unavailable rather than using
+ancestor fallback. Changing target/objective clears comparison and wake
+baselines and increments the durable configuration generation; a probe result is
+discarded if the captured generation no longer matches. Target/objective edits
+are refused while a wake is in flight. A second `monitor_watch` is likewise
+refused with 409 while the existing monitor has a wake in flight, preserving the
+old monitor ID until its correlated completion has been accounted. Cadence,
+positive budgets, and wake-instruction edits preserve the baseline and generation.
+Terminal records are read-only. `monitor_stop` records `user_stop`; legacy
+`autonudge_stop` delegates to that durable outcome only when the record is
+structured. When the directive is consumed by an in-flight structured action,
+the record becomes inactive and terminal immediately but retains that wake's
+fingerprint, claim, and delivery marker until the same turn's raw completion
+charges its turn and token usage exactly once. If raw completion never arrives,
+the user-stop outcome remains terminal and inert: it is never re-armed,
+redispatched, or charged from synthetic evidence. Closing a session records
+`session_close`; a close rollback restores only that close-owned transition.
+
+The dashboard contract is separate from legacy `/api/autonudge` mutations:
+`GET/POST /api/monitors`, `GET /api/monitors/slot/{slot}`, `PATCH
+/api/monitors/{id}`, `POST /api/monitors/{id}/stop`, and the sole explicit
+revival route `POST /api/monitors/{id}/restart`. Reads include terminal records.
+Creation uses the same positive defaults and bounds as MCP; zero is never
+unlimited. Restart rejects an unsupported future monitor version with the stable
+`unsupported_monitor_version` code and does not rewrite its exact retained raw
+payload. The AutoNudge websocket payload adds monitor state only for structured
+records, leaving the legacy websocket shape unchanged. Legacy `/api/autonudge`
+list/get routes likewise omit the field for legacy records but use the public
+projection for structured records; they never expose persistence-only monitor
+fields. Legacy `PATCH
+/api/autonudge/{id}` rejects structured ids before mutation. Legacy DELETE routes
+a structured id through the monitor stop authorizer and its audit-before-mutation
+ordering; the generic service update also fails closed for structured records.
 
 ### Security Enforcement
 
