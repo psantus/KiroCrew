@@ -1249,6 +1249,10 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # Redacts INBOUND attacker-controllable provider metadata before it is
         # stored/displayed — a sanitizer on the way in, not an output boundary.
         "dashboard/handlers/mcp_discover.py",
+        # Inbound provider sanitization: check identities are stripped of URLs and
+        # credentials before they enter canonical monitor state. The controller's
+        # later agent-session injection is the registered output boundary.
+        "monitoring/github_pull_request.py",
         # Computer use: the redaction pass runs on third-party desktop content
         # (window titles, accessibility values) on its way INTO the model's
         # context, exactly like the MCP tool-result paths above. `policy.py` owns

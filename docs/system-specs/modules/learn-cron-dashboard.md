@@ -849,8 +849,50 @@ without a model turn, suppresses an unchanged observation, and permits
 `wake_actionable` only when the actionable fingerprint differs from the last
 acknowledged wake fingerprint. The defaults are 14,400 seconds, eight completed
 agent turns, 250,000 aggregate input/output tokens, and three consecutive
-provider errors. This substrate does not yet schedule a provider probe or expose
-a new MCP tool; those are later RFC implementation slices.
+provider errors. This substrate does not itself schedule live provider probes or
+expose a new MCP tool; those are later RFC implementation slices.
+
+**GitHub pull-request shadow probe** (`monitoring/github_pull_request.py`,
+`monitoring/shadow.py`): the first typed provider adapter accepts only exact HTTPS
+pull-request URLs on public `github.com` (normalizing `www.github.com`); arbitrary
+hosts, enterprise instances, repository URLs, path suffixes, query/fragment identity,
+and non-positive pull-request numbers are refused before provider execution. The
+adapter resolves and invokes the shared hardened `github_runner` boundary with
+`GH_HOST` pinned to `github.com`. It reads the fixed `gh pr view` readiness fields and,
+for an open pull request, walks GraphQL review threads in pages of 100, stopping after
+at most ten pages. Merged and closed primary lifecycle states are terminal without a
+secondary GraphQL dependency. An incomplete, malformed-node, missing-cursor, or capped
+thread traversal is a pending fact and can never produce review-ready success.
+
+The durable observation is stable canonical JSON containing only normalized target
+identity, head revision, lifecycle/draft state, sorted check identities by outcome,
+normalized review/blocking state, unresolved-thread count/completeness, and
+mergeability. Provider ordering, timestamps, URLs, request/cursor ids, titles,
+bodies, comments, and logs do not enter it. Provider-controlled check labels pass
+through credential redaction and unconditional URL removal before persistence. The
+GitHub check-run and legacy status-context namespaces remain distinct during rerun
+collapse, and workflow-less check runs remain distinct observations so a same-label
+success cannot hide a failure. GraphQL owner, repository, and cursor variables use
+raw string fields; only the pull-request number uses typed conversion.
+SHA-256 fingerprint covers the compact sorted serialization; a collection reorder or
+volatile provider value keeps it stable, while a new head changes it. Only a non-empty
+current head may set the changed-head fact. A changed head is also a typed decision
+fact with precedence over an otherwise-green success, so it records `wake_actionable`
+instead of stopping as ready.
+
+Classification is conservative: merged is terminal success
+(`pull_request_merged`), closed-unmerged is terminal blocked, draft/pending or
+unknown checks, incomplete review-thread evidence, and unknown mergeability remain
+pending. Mergeability succeeds only for the explicit settled `CLEAN`, `HAS_HOOKS`,
+and `UNSTABLE` states, so empty or future provider values fail closed as pending;
+failed checks, requested changes, unresolved threads, conflicts, a behind head, and
+branch-protection blocks are actionable. Rate limits and transport/provider
+failures are retryable, while authentication, authorization, not-found, and local
+`gh` setup/trust failures are terminal categories. The shadow runner persists only
+the canonical observation, decision, next-probe time, and aggregate probe/error
+metrics. It has no action dispatcher, never sets a wake fingerprint or in-flight
+claim, and raises before probing or persisting when `wake_delivery` is requested.
+This slice exposes no MCP control tool and spends no model turns.
 
 Every persisted monitor mapping must encode as strict JSON; nested non-finite numbers
 and other values accepted only by Python's permissive encoder invalidate the record.

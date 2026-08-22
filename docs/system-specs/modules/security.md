@@ -944,6 +944,33 @@ the destination's ordinary security checks and to the effective
 
 `_run_json()` emits credential-free SEL tool-invocation lifecycle events around every provider CLI attempt. Unsupported providers, invalid bounds, Windows sandbox absence, untrusted executables, and sandbox rejection record `denied`. An allowlisted command awaits its synchronous critical `invoked` append on a worker thread immediately before spawn, so an audit filesystem failure denies execution rather than launching a credential-bearing process unaudited, without blocking the gateway event loop. Cancellation while that worker is active remains fail-closed and waits for it to settle; if `invoked` landed, cleanup records `failed/request_cancelled` before re-raising and never spawns the provider. Provider launchers run in a dedicated process group, and timeout, output-overflow, and cancellation cleanup kills and reaps the complete launcher/provider tree so a sandbox wrapper cannot leave `gh` or `glab` orphaned on an unread pipe. Successful JSON decoding records `completed`; spawn, output, timeout, nonzero exit, decode, cancellation, and internal errors record `failed` with only a coarse reason. Audit records contain the logical provider (`gh`/`glab`), not argv, URL, repo path, output, environment, token, thread id, or exception text. Terminal audit failures are best effort and never alter an already-completed provider result.
 
+**Structured GitHub monitor provider boundary**
+(`monitoring/github_pull_request.py`): background pull-request shadow probes are a
+separate monitor-owned consumer of the shared synchronous `github_runner`, not of the
+dashboard handler. The target gate accepts only exact public `github.com` HTTPS
+pull-request identities and normalizes `www.github.com`; it refuses arbitrary and
+enterprise hosts, credentials/ports, repository-only paths, suffixes, queries,
+fragments, and invalid owner/repository/number segments before resolving `gh`. Every
+provider call uses the runner's validated absolute executable, minimal GitHub-only
+environment, audit-or-deny invocation record, strict UTF-8 decoding, and
+`pin_host="github.com"`; no monitor-specific token source or credential storage
+exists.
+
+Raw stdout, stderr, response envelopes, URLs, timestamps, cursor/request ids, bodies,
+comments, and logs never cross the adapter boundary into monitor state, exceptions,
+or logging. Canonical state is an explicit small allowlist; check labels are stripped
+of URLs and passed through `security.redact()` before persistence. Provider failures
+are reduced in memory to fixed error kinds and reason codes, including a non-retryable
+setup kind for missing, untrusted, or unexecutable `gh`; raw diagnostic text is then
+discarded. Open-PR review-thread pagination is bounded to ten 100-node pages, and
+incomplete or capped evidence fails closed as pending; a terminal merged/closed
+primary state does not issue that secondary request. Shadow execution has no dispatcher
+dependency and refuses an enabled wake request before either provider or persistence
+work, so it cannot turn ambient GitHub authority into a model wake in this slice.
+
+The provider adapter's redaction is classified as inbound canonicalization rather
+than an egress surface.
+
 Sidebar status follows the same read-only boundary. `GET /api/chat/slots` and the WebSocket handshake schedule provider refreshes and opt into cached `ci`/`state` fields only for an exact configured-owner request, or for signed `local-app`/`local-startup` dashboard subjects when no owner is configured. Generic slot serialization omits those fields. `DashboardState` tracks owner-authorized WebSockets separately, sends generic slot updates to all authenticated clients, then overlays credential-backed status only to the owner subset. This prevents a cache populated by an owner request from being replayed to a non-owner or app-token caller. Review-thread cache removal, generation advancement, and stale in-flight detachment still complete after thread ownership validation and before mutation dispatch, so cancellation cannot preserve or repopulate pre-mutation data.
 
 **Stale pre-owner sessions must re-authenticate (`stale_session_reauth`)**: a dashboard token's subject is fixed at mint time as `owner_id or <bootstrap subject>`, and both `POST /api/auth/refresh` and the one-time-link exchange re-mint from the INCOMING subject, so a session signed in before `KIROCREW_OWNER_ID` was configured carries `local-app`/`local-startup` for its whole life. Setting or changing `KIROCREW_OWNER_ID` therefore requires every pre-existing dashboard session to re-authenticate: once an owner exists, the owner gate denies the bootstrap subjects, and that denial is the control working — re-accepting them would readmit every machine-local token to an owner-locked dashboard. The operator surprise comes from `owner_id` being overloaded: it is collected as the Slack Member ID for owner DM routing, but it is also the dashboard authorization principal and the token subject, so setting it for Slack DMs also rotates the dashboard's identity anchor. To make the remedy discoverable, every owner-gate deny site that fronts the shared owner predicate (`stale_owner_session_response` in `source_providers.py`, consulted by the chat mode/approve/worktree/followup gate, the source-provider routes, cloud provisioning, MCP-app calls, `ask_question`, the browser mutations, agent-config mutations, the AWS consent gate, and the instances federated search) labels exactly this case `401 {"code": "stale_session_reauth"}` instead of the generic `403 forbidden`, and the dashboard turns that signal into a sign-in-again banner that deliberately skips the silent-refresh path (refresh preserves the stale subject, so it can never recover this denial); direct-fetch surfaces that bypass the blessed transport (the app-sdk scoped API, the MCP-app tool relay, Mochi's approval bridge) raise the same prompt through the shared `staleOwnerSignal` detector. CHANGING an already-set owner also invalidates the previous owner's sessions, but those carry the old owner's subject — an ordinary non-owner now — so they keep the generic denial: the distinct label is only derivable for the bootstrap subjects, whose staleness is provable from the subject alone. The label is chosen strictly AFTER the deny decision — access is never granted, widened, or re-ordered — and only for an ALREADY-AUTHENTICATED dashboard-user caller whose signed subject is a bootstrap subject while an owner is configured; unsigned, invalid, app-token, and ordinary non-owner callers keep the generic denial, so the discriminator discloses nothing to an unauthenticated party.

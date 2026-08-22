@@ -86,6 +86,7 @@ def test_observation_changes_control_when_a_model_turn_is_allowed(
         (ProviderErrorKind.AUTHENTICATION, 0, MonitorDecision.STOP_BLOCKED),
         (ProviderErrorKind.AUTHORIZATION, 0, MonitorDecision.STOP_BLOCKED),
         (ProviderErrorKind.NOT_FOUND, 0, MonitorDecision.STOP_BLOCKED),
+        (ProviderErrorKind.SETUP, 0, MonitorDecision.STOP_BLOCKED),
     ],
 )
 def test_provider_failures_never_buy_a_model_turn(
@@ -197,6 +198,17 @@ def test_provider_error_observation_requires_a_string_fingerprint() -> None:
             [],
             MonitorObservationStatus.PROVIDER_ERROR,
             provider_error=ProviderErrorKind.TRANSIENT,
+        )
+
+
+def test_provider_error_observation_rejects_a_changed_head_fact() -> None:
+    """A failed provider call cannot claim to have observed a new revision."""
+    with pytest.raises(ValueError, match="head_changed"):
+        MonitorObservation(
+            "",
+            MonitorObservationStatus.PROVIDER_ERROR,
+            provider_error=ProviderErrorKind.TRANSIENT,
+            head_changed=True,
         )
 
 

@@ -43,7 +43,7 @@ def decide_monitor(
         return MonitorDecision.STOP_BUDGET
     if observation.status is MonitorObservationStatus.PROVIDER_ERROR:
         return _provider_error_decision(state, observation, state.budgets)
-    if observation.status is MonitorObservationStatus.ACTIONABLE:
+    if observation.head_changed or observation.status is MonitorObservationStatus.ACTIONABLE:
         if observation.fingerprint == state.last_wake_fingerprint:
             return MonitorDecision.NO_CHANGE
         return MonitorDecision.WAKE_ACTIONABLE
