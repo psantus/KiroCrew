@@ -44,8 +44,14 @@ from kiro_crew import platform_compat, shutdown_event
 from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.loader import config_dir
 from kiro_crew.config.paths import legacy_home
+from kiro_crew.monitoring.decision import monitor_budget_reason
 from kiro_crew.monitoring.models import (
     MONITOR_STATE_VERSION,
+    MONITOR_STOP_APPROVAL_STALL,
+    MONITOR_STOP_COMPLETION_UNAVAILABLE,
+    MONITOR_STOP_UNSUPPORTED_VERSION,
+    MonitorActionCompletion,
+    MonitorActionDisposition,
     MonitorOutcome,
     MonitorState,
     monitor_state_from_dict,
@@ -548,7 +554,20 @@ class AutoNudgeService:
                         # it impossible until a compatible version is running.
                         loop.active = False
                         loop.monitor.outcome = MonitorOutcome.BLOCKED
-                        loop.monitor.stopped_reason = "unsupported_monitor_version"
+                        loop.monitor.stopped_reason = MONITOR_STOP_UNSUPPORTED_VERSION
+                        self._store_dirty = True
+                    elif loop.monitor.wake_in_flight:
+                        # A persisted claim proves dispatch was acknowledged but
+                        # says nothing about whether the process died before or
+                        # after the turn completed. Retire it deterministically:
+                        # charging would invent work, while clearing the wake
+                        # fingerprint would permit an immediate duplicate.
+                        loop.monitor.wake_in_flight = False
+                        if loop.monitor.outcome is None:
+                            loop.monitor.outcome = MonitorOutcome.BLOCKED
+                            loop.monitor.stopped_reason = MONITOR_STOP_COMPLETION_UNAVAILABLE
+                        loop.active = False
+                        loop.next_due_ts = 0.0
                         self._store_dirty = True
                     elif loop.active:
                         # Structured monitor delivery belongs to the controller,
@@ -1059,6 +1078,148 @@ class AutoNudgeService:
 
     def list_all(self) -> list[NudgeLoop]:
         return list(self._loops.values())
+
+    async def mark_monitor_action_in_flight(
+        self,
+        monitor_id: str,
+        fingerprint: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Persist the dispatch claim for one actionable fingerprint."""
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ValueError("fingerprint must be a non-empty string")
+        checked_at = time.time() if now is None else now
+        if (
+            isinstance(checked_at, bool)
+            or not isinstance(checked_at, (int, float))
+            or not math.isfinite(checked_at)
+            or checked_at < 0
+        ):
+            raise ValueError("now must be a finite non-negative number")
+        dispatched = False
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if (
+                loop is None
+                or state is None
+                or not loop.active
+                or state.outcome is not None
+                or state.wake_in_flight
+                or state.last_wake_fingerprint == fingerprint
+            ):
+                return False
+            reason = monitor_budget_reason(state, now=checked_at)
+            if reason:
+                self._stop_monitor_for_budget(loop, reason, stopped_at=checked_at)
+            else:
+                state.last_wake_fingerprint = fingerprint
+                state.wake_in_flight = True
+                dispatched = True
+            await self._write_monitor_snapshot_locked()
+        self._emit("updated", loop)
+        return dispatched
+
+    async def record_monitor_turn_completion(
+        self,
+        completion: MonitorActionCompletion,
+    ) -> None:
+        """Charge one correlated, completed action turn exactly once."""
+        async with self._lock:
+            loop = self._loops.get(completion.monitor_id)
+            state = loop.monitor if loop is not None else None
+            if (
+                loop is None
+                or state is None
+                or not state.wake_in_flight
+                or state.last_wake_fingerprint != completion.fingerprint
+            ):
+                return
+            disposition = (
+                MonitorActionDisposition.APPROVAL_STALL
+                if loop.approval_stalled
+                else completion.disposition
+            )
+            state.wake_in_flight = False
+            state.last_completion_fingerprint = completion.fingerprint
+            state.last_completion_disposition = disposition
+            state.last_completed_at = completion.completed_ts
+            state.agent_turns += 1
+            if completion.input_tokens is None or completion.output_tokens is None:
+                state.token_usage_known = False
+            if completion.input_tokens is not None:
+                state.input_tokens += completion.input_tokens
+            if completion.output_tokens is not None:
+                state.output_tokens += completion.output_tokens
+            reason = monitor_budget_reason(state, now=completion.completed_ts)
+            if reason and state.outcome is None:
+                self._stop_monitor_for_budget(
+                    loop,
+                    reason,
+                    stopped_at=completion.completed_ts,
+                )
+            elif disposition is MonitorActionDisposition.APPROVAL_STALL and state.outcome is None:
+                loop.active = False
+                loop.next_due_ts = 0.0
+                state.outcome = MonitorOutcome.BLOCKED
+                state.stopped_reason = MONITOR_STOP_APPROVAL_STALL
+                state.stopped_at = completion.completed_ts
+                self._cancel_timer(loop.id)
+            await self._write_monitor_snapshot_locked()
+        self._emit("updated", loop)
+
+    def _stop_monitor_for_budget(
+        self,
+        loop: NudgeLoop,
+        reason: str,
+        *,
+        stopped_at: float,
+    ) -> None:
+        """Apply one structured-monitor budget stop under ``_lock``."""
+        state = loop.monitor
+        if state is None:
+            return
+        loop.active = False
+        loop.next_due_ts = 0.0
+        state.outcome = MonitorOutcome.BUDGET
+        state.stopped_reason = reason
+        state.stopped_at = stopped_at
+        self._cancel_timer(loop.id)
+
+    async def _write_monitor_snapshot_locked(self) -> None:
+        """Persist a monitor transition without releasing ``_lock`` mid-write."""
+        payload = self._serialize_state()
+        future = asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
+        try:
+            await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # Executor writes cannot be cancelled. Drain before the caller's
+            # lock scope exits so a later transition cannot be overwritten by
+            # this older snapshot after cancellation.
+            await asyncio.shield(future)
+            raise
+
+    async def record_monitor_dispatch_failure(
+        self,
+        monitor_id: str,
+        fingerprint: str,
+    ) -> None:
+        """Release an unstarted dispatch claim without charging its budget."""
+        async with self._lock:
+            loop = self._loops.get(monitor_id)
+            state = loop.monitor if loop is not None else None
+            if (
+                loop is None
+                or state is None
+                or not state.wake_in_flight
+                or state.last_wake_fingerprint != fingerprint
+            ):
+                return
+            state.wake_in_flight = False
+            state.last_wake_fingerprint = ""
+            await self._write_monitor_snapshot_locked()
+        self._emit("updated", loop)
 
     def _find_by_slot(self, slot_key: str) -> NudgeLoop | None:
         """The loop bound to *slot_key*, which may be a binding key OR a tab name.

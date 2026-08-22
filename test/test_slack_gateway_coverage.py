@@ -32,6 +32,8 @@ import pytest
 from kiro_crew import subagent as _sa
 from kiro_crew.autonudge import NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.monitoring.completion import MonitorCompletionHook
+from kiro_crew.monitoring.models import MonitorState
 from kiro_crew.slack import gateway as gw
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
@@ -235,6 +237,30 @@ class TestFireDiscordNudge:
         assert "keep checking" in synthetic.text
         # interpret_commands=False keeps a nudge body from parsing as `!command`.
         assert kwargs["interpret_commands"] is False
+
+    @pytest.mark.asyncio
+    async def test_structured_monitor_supplies_completion_hook(self):
+        """Only a structured synthetic turn carries monitor accounting state."""
+        transport = _discord_transport()
+        orch = _discord_orchestrator(transport)
+        structured = _loop(_DKEY)
+        structured.monitor = MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#123",
+            objective="review_ready",
+            created_ts=1_000.0,
+            last_wake_fingerprint="failure-a",
+            wake_in_flight=True,
+        )
+
+        assert await orch._fire_discord_nudge(structured) is True
+        _, structured_kwargs = _awaited(transport.dispatcher.handle_message)
+        assert isinstance(structured_kwargs["monitor_completion"], MonitorCompletionHook)
+
+        transport.dispatcher.handle_message.reset_mock()
+        assert await orch._fire_discord_nudge(_loop(_DKEY)) is True
+        _, legacy_kwargs = _awaited(transport.dispatcher.handle_message)
+        assert "monitor_completion" not in legacy_kwargs
 
     @pytest.mark.asyncio
     async def test_dispatch_failure_returns_false(self):
