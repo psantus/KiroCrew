@@ -77,6 +77,8 @@ import { focusSiblingSessionRow, SESSION_ROW_SELECTOR } from './chat/sessionRowN
 import { focusComposer } from './chat/composerFocus'
 import { compareBySort, comparePinnedThenSort, fmtRelativeTime, slotActivityTs } from './chat/sessionOrder'
 import type { SortKey } from './chat/sessionOrder'
+import { automationForSlot, deriveAutomationStatus, MONITOR_STATUS_KEYS } from '../monitoring/automation'
+import MonitorRadar from '../components/MonitorRadar'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields, fmtList } from '../i18n/format'
@@ -1578,8 +1580,7 @@ function ChatSidebar({
   // Purpose-vs-raw-tool-title preference, shared with the inline tool pills.
   const simplifiedToolNames = useSimplifiedToolNames()
   const uiLang = useLanguage().resolved
-  // Presence in this map means "this session is in an active goal loop".
-  const goalLoops = useAppSelector(s => s.chat.goalLoops)
+  const automations = useAppSelector(s => s.chat.automations, shallowEqual)
   // Live subagent activity per slot, for the sidebar row's "N agents running"
   // subtitle. Mirrors SubagentProgressBar's source of truth: chatSlice.subagents
   // for the store's active slot, slotActivity[slot].subagents for background
@@ -1734,11 +1735,14 @@ function ChatSidebar({
     for (const s of slots) {
       // Own-property read: the store normalizes writes through `safeKey`, so a
       // bare index read could resolve a `__proto__`-like key to a truthy value.
-      const looping = Object.prototype.hasOwnProperty.call(goalLoops ?? {}, s.key)
-      if (s.running || !!workflowActive[s.key] || looping) out.add(s.key)
+      const automation = automationForSlot(automations, s.key)
+      const automationRunning = automation?.kind === 'legacy_goal_loop'
+        ? automation.active
+        : automation?.kind === 'structured_monitor' && automation.active && !automation.terminal
+      if (s.running || !!workflowActive[s.key] || automationRunning) out.add(s.key)
     }
     return out
-  }, [slots, workflowActive, goalLoops])
+  }, [slots, workflowActive, automations])
   // A running turn is recent BY DEFINITION: the ordering key stops advancing
   // mid-turn, so a long turn would age out while it is the busiest row on screen.
   const recentSet = useMemo<Set<string>>(() => {
@@ -2268,7 +2272,12 @@ function ChatSidebar({
       return inferLane(slot, {
         subagentAwaiting: Math.min(subagentApprovalCounts[slot.key] || 0, running),
         backgroundWork: !!workflowActive[slot.key]
-          || Object.prototype.hasOwnProperty.call(goalLoops ?? {}, slot.key),
+          || (() => {
+            const automation = automationForSlot(automations, slot.key)
+            return automation?.kind === 'legacy_goal_loop'
+              ? automation.active
+              : automation?.kind === 'structured_monitor' && automation.active && !automation.terminal
+          })(),
       }) === col.state_key
     }
     const slotTags = slot.tags || []
@@ -2279,7 +2288,7 @@ function ChatSidebar({
     if (col.mode === 'all') return col.tag_ids.every(t => set.has(t))
     if (col.mode === 'none') return !col.tag_ids.some(t => set.has(t))
     return col.tag_ids.some(t => set.has(t))  // 'any'
-  }, [subagentApprovalCounts, subagentCounts, goalLoops, workflowActive])
+  }, [subagentApprovalCounts, subagentCounts, automations, workflowActive])
 
   const slotFolders = useMemo(() => {
     const valid = new Set(folders.map(f => f.id))
@@ -3497,24 +3506,30 @@ function ChatSidebar({
     // turn is parked on it, so this replaces a "Thinking…" that would otherwise
     // never change rather than annotating a finished turn.
     const needsInputLabel = i18nT('pages.chatSidebar.needs_your_answer')
+    const automation = automationForSlot(automations, s.key)
+    const monitor = automation?.kind === 'structured_monitor' ? automation : null
+    const monitorStatus = monitor ? deriveAutomationStatus(monitor) : null
+    const monitorLabel = monitorStatus
+      ? i18nT('components.sessionAutomationPopover.sidebar_status', {
+        status: i18nT(MONITOR_STATUS_KEYS[monitorStatus]),
+      })
+      : ''
     // Goal loop (auto-nudge). A loop is a MODE, not a turn state, so it is not
     // gated on `s.running` — a looping session spends most of its life mid-turn,
     // and hiding the indicator then would hide it almost always.
     // Own-property read only. The store normalizes writes through `safeKey`
     // (`__proto__`/`constructor`/`prototype` are rerouted to an inert key), so a
-    // bare `goalLoops[s.key]` would disagree with it — returning a truthy
+    // a bare lookup on an unsafe key could return an inherited truthy value,
     // `Object.prototype` for such a key and rendering "Loop · undefined" while
     // suppressing the row's unread dot.
-    const goalLoop = Object.prototype.hasOwnProperty.call(goalLoops ?? {}, s.key)
-      ? goalLoops[s.key]
-      : undefined
+    const goalLoop = automation?.kind === 'legacy_goal_loop' ? automation : undefined
     // `max_cycles === 0` means unlimited (autonudge.py NudgeLoop default), so
     // there is no denominator to show — fall back to a bare count.
     const goalLoopLabel = !goalLoop
       ? ''
-      : goalLoop.max_cycles > 0
-        ? i18nT('pages.chatSidebar.loop', { count: goalLoop.cycle_count, total: goalLoop.max_cycles })
-        : i18nT('pages.chatSidebar.loop_2', { count: goalLoop.cycle_count })
+      : goalLoop.maxCycles > 0
+        ? i18nT('pages.chatSidebar.loop', { count: goalLoop.cycleCount, total: goalLoop.maxCycles })
+        : i18nT('pages.chatSidebar.loop_2', { count: goalLoop.cycleCount })
     // The loop is armed but its session's last turn died — a trailing error row
     // or an unanswered user row, the state behind the composer's Resume button —
     // and nothing is executing on its behalf. The pulsing dot below would claim
@@ -3615,6 +3630,23 @@ function ChatSidebar({
         ),
       },
       {
+        // An actionable wake is executing agent work now, so it outranks the
+        // ordinary work signals below while remaining under decisions the user
+        // owes. Scheduled and terminal monitors are intentionally resolved at
+        // the tail: retained monitor state must not hide live work or unread.
+        key: 'structured_monitor_action',
+        when: !!monitor && monitorStatus === 'action_running',
+        build: () => (
+          <div className={ROW_STATUS_LINE_CLS} title={monitorLabel}>
+            <MonitorRadar actionRunning className="text-accent" />
+            <span className="truncate">
+              <span className="font-medium">{monitorLabel}</span>
+              {monitor?.latest.summary ? <span className="text-muted"> · {monitor.latest.summary}</span> : null}
+            </span>
+          </div>
+        ),
+      },
+      {
         // An active goal loop outranks every "working" signal below it but
         // stays under both approval branches: an owed decision must never read
         // as unattended progress. Nothing is lost by ranking it high —
@@ -3624,7 +3656,7 @@ function ChatSidebar({
         key: 'goal_loop',
         when: !!goalLoop,
         build: () => (
-          <div className={ROW_STATUS_LINE_CLS} title={goalLoopStalled ? i18nT('pages.chatSidebar.goal_loop_interrupted_title') : goalLoop && goalLoop.max_cycles > 0 ? i18nT('pages.chatSidebar.goal_loop_cycle', { count: goalLoop.cycle_count, total: goalLoop.max_cycles }) : i18nT('pages.chatSidebar.goal_loop_cycle_no_cap', { count: goalLoop?.cycle_count ?? 0 })}>
+          <div className={ROW_STATUS_LINE_CLS} title={goalLoopStalled ? i18nT('pages.chatSidebar.goal_loop_interrupted_title') : goalLoop && goalLoop.maxCycles > 0 ? i18nT('pages.chatSidebar.goal_loop_cycle', { count: goalLoop.cycleCount, total: goalLoop.maxCycles }) : i18nT('pages.chatSidebar.goal_loop_cycle_no_cap', { count: goalLoop?.cycleCount ?? 0 })}>
             <Goal size={ROW_ICON_PX} className={`shrink-0 ${goalLoopStalled ? 'text-warn' : 'text-accent animate-pulse'}`} aria-hidden />
             <span className="truncate"><span className={`font-medium ${goalLoopStalled ? 'text-warn' : 'text-accent'}`}>{goalLoopLabel}{goalLoopStalled ? ` — ${i18nT('pages.chatSidebar.loop_interrupted')}` : ''}</span>{goalLoopDetail ? <span className="text-muted"> · {goalLoopDetail}</span> : null}</span>
           </div>
@@ -3664,7 +3696,7 @@ function ChatSidebar({
         // with a definite direction, and rotation reads as progress where a
         // fading dot reads as a mere marker.
         key: 'running',
-        when: runningSet.has(s.key),
+        when: !!s.running,
         build: () => {
           const text = slotStatusText(slotStatusDetail[s.key], simplifiedToolNames, uiLang)
           // `title` because this is the one status text that is unbounded — a tool
@@ -3677,6 +3709,31 @@ function ChatSidebar({
             </div>
           )
         },
+      },
+      {
+        // Passive monitor state is useful only after stronger row signals have
+        // had their turn. An unread completion also wins so the retained
+        // terminal record cannot permanently suppress the user's inbox marker.
+        key: 'structured_monitor_passive',
+        when: !!monitor && monitorStatus !== 'action_running' && !unreadSet.has(s.key),
+        build: () => (
+          <div className={ROW_STATUS_LINE_CLS} title={monitorLabel}>
+            <MonitorRadar
+              actionRunning={false}
+              className={monitorStatus === 'success'
+                ? 'text-ok'
+                : monitorStatus === 'blocked' || monitorStatus === 'budget_stopped'
+                  ? 'text-warn'
+                  : 'text-muted'}
+            />
+            <span className="truncate">
+              <span className="font-medium">{monitorLabel}</span>
+              {monitor?.latest.summary
+                ? <span className="text-muted"> · {monitor.latest.summary}</span>
+                : null}
+            </span>
+          </div>
+        ),
       },
     ] as const).find(entry => entry.when)?.build() ?? null
 

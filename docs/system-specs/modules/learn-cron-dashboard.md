@@ -1426,8 +1426,12 @@ assembles its HTTP application.
 
 `MonitorController` currently accepts only a public GitHub pull request with the
 `review_ready` objective. The typed provider probe runs off the event loop. The
-controller persists canonical allowlisted facts, fingerprint, error counters,
-decision, and next deadline before returning. `NO_CHANGE`, `RECORD_ONLY`,
+controller persists canonical allowlisted facts, fingerprint, dedicated latest
+classification/reason/summary fields, error counters, decision, and next deadline
+before returning. `last_observation` remains the GitHub fact snapshot; it never
+contains the typed fingerprint, status, reason, or summary. A provider error updates
+the dedicated latest fields while retaining the last good canonical facts and
+fingerprint. `NO_CHANGE`, `RECORD_ONLY`,
 `RETRY_PROVIDER`, and all terminal decisions dispatch zero agent turns. Retryable
 provider errors use bounded exponential backoff; terminal provider, success,
 blocked, and budget outcomes remain inspectable with stable reason codes.
@@ -1496,6 +1500,11 @@ charges its turn and token usage exactly once. If raw completion never arrives,
 the user-stop outcome remains terminal and inert: it is never re-armed,
 redispatched, or charged from synthetic evidence. Closing a session records
 `session_close`; a close rollback restores only that close-owned transition.
+The dashboard treats websocket monitor frames as authoritative over mutation
+responses, which may arrive after a newer terminal frame. A `removed` frame is
+a slot tombstone handled before payload validation and deletes either automation
+kind from the shared collection, so malformed or stale loop contents cannot
+leave a phantom blocked monitor behind.
 
 The dashboard contract is separate from legacy `/api/autonudge` mutations:
 `GET/POST /api/monitors`, `GET /api/monitors/slot/{slot}`, `PATCH
@@ -1512,6 +1521,75 @@ fields. Legacy `PATCH
 /api/autonudge/{id}` rejects structured ids before mutation. Legacy DELETE routes
 a structured id through the monitor stop authorizer and its audit-before-mutation
 ordering; the generic service update also fails closed for structured records.
+The public monitor projection used by list, slot, WebSocket, and authenticated
+`monitor_inspect` reads includes the canonical `last_observation` plus the dedicated
+`last_observation_status`, `last_observation_reason_code`, and
+`last_observation_summary`; persistence-only and raw provider fields remain excluded.
+The projection reconstructs GitHub facts from fixed root and check-bucket allowlists
+with a deep copy. Unknown persisted keys are omitted, and an incomplete or malformed
+canonical shape projects as an empty observation; non-string enum fields fail
+closed before membership checks and cannot abort a list, WebSocket, or inspect
+response.
+
+The SPA represents this compatibility boundary as one discriminated
+`AutomationRecord`: `legacy_goal_loop` and `structured_monitor` never share an
+implicit shape. One pure normalizer accepts both REST loop records and
+`autonudge_state` WebSocket envelopes. A structured marker is never downgraded
+when its version or required fields are invalid; it becomes retained,
+non-actionable blocked state instead. The normalizer consumes the durable
+`wake_count` directly, along with the authoritative probe, completed-turn,
+provider-error, and token counters. It never infers wakes from current delivery
+state.
+
+Redux owns the only mutable automation collection. Initial connection starts the
+legacy and structured list reads together, fences their combined result by
+connection generation, protects each slot changed by a newer live frame or
+tombstone, and folds both through the same normalizer used for live WebSocket
+updates. Channel session keys are normalized through the dashboard's filename-safe
+slot-key fold before collection indexing, live-generation tracking, or tombstone
+removal, so `slack:<ts>` state addresses the visible `slack_<ts>` slot. A live
+frame for one slot does not discard unaffected legacy or terminal records from the
+seed. Structured state wins if both responses name one slot.
+Chat detail and sidebar select from that collection, so target, status, activity
+lanes, and terminal retention cannot disagree because two components cached
+different wire records. Slot teardown clears ephemeral conversation state but
+does not evict retained automation evidence; only an authoritative automation
+seed or tombstone removes that record, so resumed history keeps its terminal
+reason and Restart action. The current-version normalizer validates every recognized
+boolean, nullable enum, timestamp, observation, action, outcome, and bounded
+configuration field, including the active-versus-terminal invariant; a malformed
+record degrades to a non-actionable blocked projection. The shared status
+derivation covers `arm_pending`,
+`active`, `backing_off`, `action_running`, `success`, `blocked`,
+`budget_stopped`, and `user_stopped`; only an in-flight dispatched wake animates
+as agent work. That state alone outranks foreground, workflow, and subagent work
+in the sidebar. Scheduled and retained terminal monitors sit below those signals
+and below unread, so passive state cannot hide work or suppress the inbox marker.
+For a non-empty GitHub observation the normalizer validates the exact canonical
+fact categories: blocking review, all four check-name buckets, draft, head revision,
+kind, mergeability, review decision, review-thread completeness, pull-request state,
+target, and unresolved-thread count. It reads classification, reason, and summary
+only from their dedicated adjacent fields, never by interpreting canonical facts as
+a `MonitorObservation` object. Both the root observation and nested checks object
+must have their exact version-1 key sets; an extra key makes the record inert rather
+than letting an unbounded provider field ride a future wire frame.
+
+The chat composer exposes structured monitor creation and mutation only through
+the dedicated `/api/monitors` routes. A new pull-request monitor starts from the
+300-second cadence, 14,400-second runtime, eight-turn, 250,000-token, and
+three-provider-error defaults. The form enforces the backend bounds: cadence
+15–86,400 seconds, runtime 1–604,800 seconds, agent turns 1–8, tokens
+1–1,000,000, provider errors 1–20, and at most 1,000 wake-instruction characters.
+Each field exposes the same HTML bound and a localized inline error. Updates
+track dirty fields, reconcile untouched values from same-monitor WebSocket
+frames, and send only the dirty fields, so a stale form cannot move a fresh
+deadline or overwrite concurrent configuration. Its detail renders target,
+objective, next probe, wake instructions,
+all budgets, latest classification/decision, probe/wake/turn/token/provider-error
+usage, and terminal reason. Terminal records are retained and read-only; Restart
+is their sole action. The legacy goal-loop form remains reachable behind an
+explicit costly label and continues to use `/api/autonudge`, including its
+historical `max_cycles = 0` unlimited meaning.
 
 ### Security Enforcement
 

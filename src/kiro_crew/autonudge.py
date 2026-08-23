@@ -1247,6 +1247,9 @@ class AutoNudgeService:
             state.last_probe_at = now
             state.last_decision = decision
             observation = result.observation
+            state.last_observation_status = observation.status
+            state.last_observation_reason_code = observation.reason_code
+            state.last_observation_summary = observation.summary
             if observation.status is MonitorObservationStatus.PROVIDER_ERROR:
                 state.provider_error_count += 1
                 state.consecutive_provider_errors += 1
@@ -1423,6 +1426,9 @@ class AutoNudgeService:
             if reset_baseline:
                 state.config_generation += 1
                 state.last_observation = {}
+                state.last_observation_status = None
+                state.last_observation_reason_code = ""
+                state.last_observation_summary = ""
                 state.last_fingerprint = ""
                 state.last_observed_at = 0.0
                 state.last_wake_fingerprint = ""

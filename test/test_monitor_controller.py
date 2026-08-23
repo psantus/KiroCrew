@@ -80,6 +80,7 @@ def _result(status: MonitorObservationStatus, fingerprint: str = "fp-1"):
             status,
             provider_error=error,
             reason_code="provider_transient" if error else "review_ready",
+            summary="Provider retry scheduled." if error else "Pull request is ready.",
         ),
     )
 
@@ -151,6 +152,28 @@ async def test_unchanged_probe_dispatches_zero_turns_and_preserves_deadline(tmp_
 
 
 @pytest.mark.asyncio
+async def test_probe_persists_canonical_facts_beside_typed_latest_classification(tmp_path):
+    """Collapsing typed status into canonical facts breaks the public monitor contract."""
+    result = _result(MonitorObservationStatus.SUCCESS)
+    service, loop, controller = await _armed(
+        tmp_path,
+        result=result,
+        dispatch=AsyncMock(),
+    )
+
+    await controller.tick(loop, now=120.0)
+
+    assert loop.monitor is not None
+    assert loop.monitor.last_observation == result.canonical
+    assert loop.monitor.last_observation_status is MonitorObservationStatus.SUCCESS
+    assert loop.monitor.last_observation_reason_code == "review_ready"
+    assert loop.monitor.last_observation_summary == "Pull request is ready."
+    assert "status" not in loop.monitor.last_observation
+    assert "reason_code" not in loop.monitor.last_observation
+    assert "summary" not in loop.monitor.last_observation
+
+
+@pytest.mark.asyncio
 async def test_retry_backoff_is_bounded_and_dispatches_zero_turns(tmp_path):
     dispatched = AsyncMock()
     service, loop, controller = await _armed(
@@ -158,14 +181,22 @@ async def test_retry_backoff_is_bounded_and_dispatches_zero_turns(tmp_path):
         result=_result(MonitorObservationStatus.PROVIDER_ERROR),
         dispatch=dispatched,
     )
+    assert loop.monitor is not None
+    last_good = _result(MonitorObservationStatus.PENDING)
+    loop.monitor.last_observation = deepcopy(last_good.canonical)
+    loop.monitor.last_fingerprint = last_good.observation.fingerprint
 
     first = await controller.tick(loop, now=120.0)
     second = await controller.tick(loop, now=135.0)
 
     assert first is second is MonitorDecision.RETRY_PROVIDER
     dispatched.assert_not_awaited()
-    assert loop.monitor is not None
     assert loop.next_due_ts == loop.monitor.next_probe_at == 165.0
+    assert loop.monitor.last_observation == last_good.canonical
+    assert loop.monitor.last_fingerprint == last_good.observation.fingerprint
+    assert loop.monitor.last_observation_status is MonitorObservationStatus.PROVIDER_ERROR
+    assert loop.monitor.last_observation_reason_code == "provider_transient"
+    assert loop.monitor.last_observation_summary == "Provider retry scheduled."
 
 
 @pytest.mark.asyncio
@@ -513,6 +544,10 @@ async def test_old_configuration_probe_cannot_apply_after_target_update(tmp_path
         dispatch=dispatched,
     )
     controller = MonitorController(service, dispatched, provider=provider)
+    assert loop.monitor is not None
+    loop.monitor.last_observation_status = MonitorObservationStatus.PENDING
+    loop.monitor.last_observation_reason_code = "checks_pending"
+    loop.monitor.last_observation_summary = "Two checks are pending."
 
     tick = asyncio.create_task(controller.tick(loop, now=120.0))
     assert await asyncio.to_thread(provider.entered.wait, 1)
@@ -529,6 +564,9 @@ async def test_old_configuration_probe_cannot_apply_after_target_update(tmp_path
     assert loop.monitor.config_generation == 2
     assert loop.monitor.target == "https://github.com/acme/widgets/pull/8"
     assert loop.monitor.last_observation == {}
+    assert loop.monitor.last_observation_status is None
+    assert loop.monitor.last_observation_reason_code == ""
+    assert loop.monitor.last_observation_summary == ""
     assert loop.monitor.last_fingerprint == ""
     assert not loop.monitor.wake_in_flight
     dispatched.assert_not_awaited()

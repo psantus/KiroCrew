@@ -24,7 +24,8 @@ import { useSimplifiedToolNames } from '../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../i18n/LanguageProvider'
 import { pickToolLabel } from '../utils/toolLabel'
 import TrustDropdown from './TrustDropdown'
-import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
+import SessionAutomationPopover from './SessionAutomationPopover'
+import type { AutomationRecord } from '../monitoring/automation'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { isTouchDevice } from '../utils/isTouchDevice'
 import { consumeComposerRelease } from '../pages/chat/composerFocus'
@@ -376,11 +377,11 @@ interface ChatInputProps {
   cleanMode?: boolean
   /** User-sent messages for ↑/↓ history navigation (oldest → newest). */
   sentMessages?: string[]
-  /** Auto-nudge loop state for this slot (if any) */
-  onAutoNudgeClick?: (open: boolean) => void
-  autoNudgeLoop?: AutoNudgeLoop | null
-  autoNudgeOpen?: boolean
-  onAutoNudgeChange?: (loop: AutoNudgeLoop | null) => void
+  /** Authoritative automation record for this slot (if any). */
+  onAutomationClick?: (open: boolean) => void
+  automation?: AutomationRecord | null
+  automationOpen?: boolean
+  onAutomationChange?: (automation: AutomationRecord | null) => void
   /** Send-key mode. Default 'enter'. */
   sendOnEnter?: SendMode
   /** Follow-up options from assistant message */
@@ -667,10 +668,10 @@ function ChatInput({
   memoryMode,
   cleanMode,
   sentMessages,
-  onAutoNudgeClick,
-  autoNudgeLoop,
-  autoNudgeOpen,
-  onAutoNudgeChange,
+  onAutomationClick,
+  automation,
+  automationOpen,
+  onAutomationChange,
   sendOnEnter = 'enter',
   followUpOptions,
   followUpPicked,
@@ -1081,8 +1082,8 @@ function ChatInput({
   // content width — only this remeasure can refresh the cue. Boolean presence,
   // not the callback itself: the handler's identity may change every render
   // and would re-run the effect for nothing.
-  const hasAutoNudge = !!onAutoNudgeClick
-  useEffect(() => { remeasureControlRow() }, [hasAutoNudge, autoNudgeLoop, approvalMode, isMobile, remeasureControlRow])
+  const hasAutomation = !!onAutomationClick
+  useEffect(() => { remeasureControlRow() }, [hasAutomation, automation, approvalMode, isMobile, remeasureControlRow])
   const ime = useImeGuard()
   const resolvedPlaceholder = placeholder || i18nT('components.chatInput.message_placeholder', { bot: botName })
   // An icon swap alone announces nothing, so the empty-state placeholder carries
@@ -2735,13 +2736,13 @@ function ChatInput({
             <div className="relative min-w-0 flex-1">
               <div ref={attachControlRow} data-testid="composer-control-row" className="flex items-center gap-0.5 overflow-x-auto">
 
-              {onAutoNudgeClick && (
-                <AutoNudgePopover
+              {onAutomationClick && (
+                <SessionAutomationPopover
                   slotKey={slotId || ''}
-                  loop={autoNudgeLoop || null}
-                  open={autoNudgeOpen || false}
-                  onOpenChange={v => onAutoNudgeClick(v)}
-                  onChange={onAutoNudgeChange || (() => {})}
+                  automation={automation || null}
+                  open={automationOpen || false}
+                  onOpenChange={v => onAutomationClick(v)}
+                  onChange={onAutomationChange || (() => {})}
                   // Same condition as the Resume placeholder (`resumeOffered`):
                   // whenever the composer says "press Resume", the loop chip
                   // must not pulse as if a cycle were executing.

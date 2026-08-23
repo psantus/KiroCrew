@@ -33,6 +33,8 @@ import {
   retireStatelessQuestion, capturePendingAskId, confirmOptimisticSend,
   requestSlotReveal,
   mcpAppKey,
+  selectAutomationForSlot,
+  sseAutomation,
 } from '../store/chatSlice'
 import { confirmedDelivered } from '../utils/sendDelivery'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
@@ -46,7 +48,7 @@ import { api } from '../api/client'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import type { PlanStepInput } from '../api/client'
 import { useProvider } from '../providers'
-import { type AutoNudgeLoop } from '../components/AutoNudgePopover'
+import type { AutomationRecord } from '../monitoring/automation'
 import { fileReadUrl } from '../utils/fileReadUrl'
 import { safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
@@ -1166,8 +1168,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const [reasoningEffortDropdown, setReasoningEffortDropdown] = useState(false)
   const [reasoningEffortBtnRect, setReasoningEffortBtnRect] = useState<DOMRect | null>(null)
   const reasoningEffortDropdownRef = useRef<HTMLDivElement>(null)
-  const [autoNudgeOpen, setAutoNudgeOpen] = useState(false)
-  const [autoNudgeLoop, setAutoNudgeLoop] = useState<AutoNudgeLoop | null>(null)
+  const [automationOpen, setAutomationOpen] = useState(false)
+  const automation = useAppSelector(state => activeSlot
+    ? selectAutomationForSlot(state, activeSlot)
+    : null)
   const approvalMode = useAppSelector(s => s.dashboard.approvalMode)
 
   // ── Reasoning effort dropdown click-outside ──
@@ -1185,28 +1189,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return () => document.removeEventListener('mousedown', handler)
   }, [reasoningEffortDropdown, reasoningEffortBtnRect])
 
-  // ── Auto-nudge: fetch loop state for active slot, subscribe to WS updates ──
+  // Close the slot-scoped automation surface on navigation. Its record comes
+  // from the same Redux collection the sidebar reads; the WebSocket hook owns
+  // both the cold REST snapshot and live updates.
   useEffect(() => {
-    // Clear stale state and close the popover on slot switch so it remounts
-    // with fresh useState initializers sourced from the new slot's loop.
-    // Otherwise the popover's internal message/idleSecs/maxCycles retain
-    // values from the previously-active slot and a Start click would arm the
-    // wrong nudge on the new session.
-    setAutoNudgeLoop(null)
-    setAutoNudgeOpen(false)
-    if (!activeSlot) return
-    let cancelled = false
-    fetch(`/api/autonudge/slot/${encodeURIComponent(activeSlot)}`)
-      .then(r => r.json())
-      .then(d => { if (!cancelled) setAutoNudgeLoop(d.loop || null) })
-      .catch(() => {})
-    const onEvent = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { slot?: string; loop?: AutoNudgeLoop; event?: string }
-      if (!detail || detail.slot !== activeSlot) return
-      setAutoNudgeLoop(detail.event === 'removed' ? null : (detail.loop ?? null))
-    }
-    window.addEventListener('autonudge_state', onEvent)
-    return () => { cancelled = true; window.removeEventListener('autonudge_state', onEvent) }
+    setAutomationOpen(false)
   }, [activeSlot])
   const {
     scrollerRef,
@@ -6092,8 +6079,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // bound to the slot, so a historical card never opens a successor loop's
     // controls.
     if (m.role === 'nudge') {
-      const ownLoop = nudgeMatchesLoop(m, autoNudgeLoop?.id)
-      return <NudgeCard key={key} message={m} disclosureKey={key} onOpenLoop={ownLoop ? () => setAutoNudgeOpen(true) : undefined} />
+      const ownLoop = nudgeMatchesLoop(m, automation?.id)
+      return <NudgeCard key={key} message={m} disclosureKey={key} onOpenLoop={ownLoop ? () => setAutomationOpen(true) : undefined} />
     }
     if (m.kind === 'stop_event' || m.meta?.kind === 'stop_event') return <StopEventCard key={m.meta?.id as string ?? key} message={m} />
     // A synthetic turn-recovery continuation (tool refusal / stalled turn /
@@ -6209,7 +6196,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // apply-plan handler, so it belongs here for correctness. approve/send/
     // dismissApproval are NOT referenced in this renderer (user/approval rows go
     // through renderUserContentCb), so they are omitted to keep it stable.
-  }, [messages, visibleIndexMap, slotRunning, slotState, lastTextIdx, handleFileOpen, handleArtifactOpen, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, renderUserContentCb, highlightTs, activeSlotTitle, mode, dispatch, handleOpenDiff, handlePlanFromHere, navigate, planTaskId, artifactPaths, autoNudgeLoop, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress])
+  }, [messages, visibleIndexMap, slotRunning, slotState, lastTextIdx, handleFileOpen, handleArtifactOpen, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, renderUserContentCb, highlightTs, activeSlotTitle, mode, dispatch, handleOpenDiff, handlePlanFromHere, navigate, planTaskId, artifactPaths, automation, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress])
 
   const [mobileSessions, setMobileSessions] = useState(false)
   // Close mobile sessions panel when a session is selected
@@ -7365,10 +7352,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               providerId={provider.id}
               reasoningEffort={effectiveEffort}
               onReasoningEffortClick={provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel) ? (rect) => { setReasoningEffortBtnRect(rect); setReasoningEffortDropdown(!reasoningEffortDropdown) } : undefined}
-              onAutoNudgeClick={setAutoNudgeOpen}
-              autoNudgeLoop={autoNudgeLoop}
-              autoNudgeOpen={autoNudgeOpen}
-              onAutoNudgeChange={setAutoNudgeLoop}
+              onAutomationClick={setAutomationOpen}
+              automation={automation}
+              automationOpen={automationOpen}
+              onAutomationChange={(next: AutomationRecord | null) => {
+                if (next) dispatch(sseAutomation(next))
+                else if (automation?.kind === 'legacy_goal_loop') {
+                  dispatch(sseAutomation({ ...automation, active: false }))
+                }
+              }}
               onOptimizeResult={handleOptimizeResult}
               memoryMode={currentSlot?.memory_mode ?? 'persistent'}
               cleanMode={currentSlot?.clean_mode}
@@ -7614,4 +7606,3 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     </RowDisclosureProvider>
   )
 }
-
