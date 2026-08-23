@@ -1766,7 +1766,9 @@ def _audit_peer_identity_denied(reason: str, peer_pid: int | None, stub_uuid: st
         logger.debug("SEL audit emit for peer identity denial failed", exc_info=True)
 
 
-def _apply_claim(frame: dict[str, Any]) -> dict[str, Any]:
+async def _apply_claim(
+    frame: dict[str, Any], pool: Optional["BackendPool"] = None
+) -> dict[str, Any]:
     """Apply a ``claim`` frame to every indexed connection of the target PID.
 
     Returns the ack frame. Validation is deny-by-default: a non-integer or
@@ -1818,7 +1820,10 @@ def _apply_claim(frame: dict[str, Any]) -> dict[str, Any]:
     # be rejected.
     raw_token = frame.get("pid_start_id")
     claim_token = raw_token if isinstance(raw_token, str) else None
-    for conn in conns:
+    # Snapshot: the eviction below AWAITS, and a connection disconnecting
+    # during that await mutates the live ``conns`` set mid-iteration —
+    # aborting the claim with no ack and leaving the remaining stubs stale.
+    for conn in list(conns):
         recorded_token = conn.pid_start_ids.get(pid)
         if claim_token is not None and recorded_token is not None and claim_token != recorded_token:
             skipped += 1
@@ -1839,7 +1844,28 @@ def _apply_claim(frame: dict[str, Any]) -> dict[str, Any]:
         old_key = conn.caller.session_key if conn.caller is not None else ""
         if old_key == updated_caller.session_key:
             continue  # already correct — idempotent re-claim
+        # Reassign the owner BEFORE the eviction awaits: a subscribe arriving
+        # during that await must already be authorized as the NEW caller —
+        # authorized as the old one, its grant would land on a stub the old
+        # session no longer owns and route that session's URIs to the new
+        # owner.
         conn.caller = updated_caller
+        if pool is not None:
+            # The stub changed OWNER: its resource subscriptions belong to
+            # the old principal, and without eviction the new session would
+            # keep receiving the old session's resource-update URIs (which
+            # can carry tokens or presigned params). Caller-binding
+            # ownership lives here at the connection layer, so this is the
+            # one moment the clearance fires; the backend releases upstream
+            # as the grant-time caller.
+            for backend in pool.backends_hosting_stub(conn.stub_uuid):
+                try:
+                    await backend.evict_stub_subscriptions(conn.stub_uuid)
+                except Exception:
+                    logger.exception(
+                        "claim: subscription eviction failed for stub %s",
+                        conn.stub_uuid,
+                    )
         updated += 1
         _audit_caller_claimed(old_key, updated_caller.session_key, conn.pool_label, "allowed")
         logger.info(
@@ -2111,7 +2137,7 @@ async def _handle_connection(
     # (fixes warm-pool re-claim staleness). Validation + auditing live in
     # ``_apply_claim``.
     if register.get("type") == "claim":
-        await _write_json_line(writer, _apply_claim(register))
+        await _write_json_line(writer, await _apply_claim(register, pool))
         return
 
     # Abort-push short-circuit (one-shot control connection from the main
@@ -2681,6 +2707,7 @@ async def _handle_connection(
                     backend,
                     inbox,
                     writer_task,
+                    caller=caller,
                 )
                 if recovered is None:
                     # Genuinely unrecoverable (no captured init, circuit
@@ -2901,6 +2928,7 @@ async def _respawn_backend_for_stub(
     old_backend: Backend,
     old_inbox: Optional["asyncio.Queue[bytes]"],
     old_writer_task: Optional[asyncio.Task[None]],
+    caller: Optional[CallerContext] = None,
 ) -> Optional[tuple[Backend, "asyncio.Queue[bytes]", asyncio.Task[None]]]:
     """Rebuild a fresh backend for ``stub_uuid`` after its shared backend
     died and re-bind this stub to it transparently.
@@ -2941,6 +2969,13 @@ async def _respawn_backend_for_stub(
                 # catch a hang). Mirrors _write_json_line's bounded drain.
                 await asyncio.wait_for(writer.drain(), timeout=_WRITE_REPLY_TIMEOUT_SECS)
 
+    # Captured BEFORE detach (which prunes them): the URIs whose live
+    # subscriptions must be replayed onto the replacement backend, or they
+    # silently go dark — kiro-cli never learns the old backend died, so it
+    # will never re-subscribe on its own.
+    replay_uris: list[str] = []
+    with contextlib.suppress(Exception):
+        replay_uris = old_backend.resource_subscription_uris(stub_uuid)
     with contextlib.suppress(Exception):
         await old_backend.detach_stub(stub_uuid)
 
@@ -2995,6 +3030,27 @@ async def _respawn_backend_for_stub(
             )
             return None
         new_inbox = await new_backend.attach_stub(stub_uuid)
+        if replay_uris:
+            # A server refusal of an individual replayed subscribe is
+            # fail-closed by design (the update goes undelivered, never
+            # mis-attributed). A WRITE failure is different: the fresh
+            # backend's pipe is already broken, so reporting this respawn
+            # as a success would hand the stub a backend whose replayed
+            # subscriptions are silently dark forever. Give up loudly —
+            # the caller tears the stub down and kiro-cli reconnects.
+            try:
+                await new_backend.replay_resource_subscriptions(
+                    stub_uuid, replay_uris, caller=caller
+                )
+            except BackendGone as exc:
+                logger.info(
+                    "respawn give-up (subscription replay failed) " "stub=%s pool=%s: %s",
+                    stub_uuid,
+                    pool_key.human_readable(),
+                    exc,
+                )
+                await new_backend.detach_stub(stub_uuid)
+                return None
     finally:
         # A private backend never took a reservation, and releasing one would
         # decrement a POOLED connection sharing this digest (see
