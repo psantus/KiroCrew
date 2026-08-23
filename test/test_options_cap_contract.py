@@ -42,7 +42,7 @@ from kiro_crew.messaging.renderer import (
 from kiro_crew.messaging.transport import TransportCapabilities
 
 #: channel_type -> the test class below that pins its enforcement.
-PINNED_WIDGET_CHANNELS = {"slack", "discord", "telegram", "teams"}
+PINNED_WIDGET_CHANNELS = {"slack", "discord", "telegram", "teams", "webex"}
 
 
 def _wecom_renderer() -> Any:
@@ -59,13 +59,6 @@ def _weixin_renderer() -> Any:
     return WeixinRenderer(
         object(), "peer", WEIXIN_CAPABILITIES, ctx_store=object(), account_id="acct"
     )
-
-
-def _webex_renderer() -> Any:
-    from kiro_crew.webex.renderer import WebexRenderer
-    from kiro_crew.webex.transport import WEBEX_CAPABILITIES
-
-    return WebexRenderer(object(), "room", WEBEX_CAPABILITIES)
 
 
 def _imessage_renderer() -> Any:
@@ -89,7 +82,6 @@ def _feishu_renderer() -> Any:
 ZERO_WIDGET_RENDERERS: dict[str, Callable[[], Any]] = {
     "wecom": _wecom_renderer,
     "weixin": _weixin_renderer,
-    "webex": _webex_renderer,
     "imessage": _imessage_renderer,
     "feishu": _feishu_renderer,
 }
@@ -759,3 +751,48 @@ class TestTeamsEnforcement:
         asyncio.run(_go())
 
         assert "AKIAIOSFODNN7EXAMPLE" not in "\n".join(cli.sent)
+
+
+class TestWebexEnforcement:
+    def test_card_actions_cap_at_declared_and_overflow_is_visible(self) -> None:
+        """Drive the REAL render path, not the helper.
+
+        The ratchet exists because a renderer can call the shared cap and then
+        build its widget from the uncapped list, so the only assertion worth
+        making is against what the client was actually asked to send.
+        """
+        from test_webex_renderer import FakeClient
+
+        from kiro_crew.messaging.renderer import DONE, TEXT_CHUNK, OutputEvent
+        from kiro_crew.webex.renderer import WebexRenderer
+        from kiro_crew.webex.transport import WEBEX_CAPABILITIES
+
+        n = WEBEX_CAPABILITIES.max_buttons
+        trailer = " | ".join(f"Choice {i}" for i in range(1, n + 4))
+        cli = FakeClient()
+        # A card is rendered only when its press can be resolved, so the real path
+        # needs the dispatcher's choice store -- the card is the last thing a turn
+        # sends, and a renderer-owned map is gone before any press arrives.
+        r = WebexRenderer(
+            cli,
+            "ROOM",
+            WEBEX_CAPABILITIES,  # type: ignore[arg-type]
+            publish_choices=lambda _nonce, _choices: None,
+        )
+
+        async def _go() -> None:
+            await r.on_turn_start()
+            await r.dispatch(OutputEvent(kind=TEXT_CHUNK, text=f"Pick.\n\n[OPTIONS: {trailer}]"))
+            await r.dispatch(OutputEvent(kind=DONE, stop_reason=""))
+
+        asyncio.run(_go())
+
+        card = next(kw for (_, _, kw) in cli.sent_full if kw.get("attachments"))
+        actions = card["attachments"][0]["content"]["actions"]
+        labels = [a["title"] for a in actions]
+        assert len(labels) == n, "webex card actions were uncapped"
+        assert labels == [f"Choice {i}" for i in range(1, n + 1)]
+        # Overflow is numbered CONTINUING the widget slots, never dropped.
+        final = cli.edits[-1][2]
+        assert f"{n + 1}. Choice {n + 1}" in final
+        assert f"{n + 3}. Choice {n + 3}" in final

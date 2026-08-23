@@ -81,10 +81,34 @@ def schemas() -> list[dict[str, Any]]:
                 "reply_broadcast and unfurl_links/unfurl_media are Slack protocol "
                 'options: combining any of them with session="discord" is REFUSED, '
                 "not silently ignored."
+                "\n\nTo reach a NON-Slack channel (Webex, Telegram, Discord, …) at"
+                " a specific destination, pass channel_type plus target_id, where"
+                " target_id is one of the opaque ids that channel exposes as a"
+                " configured destination. The channel's own allow-list is"
+                " re-checked when the message is sent, so an id that is no longer"
+                " configured is refused. This pair addresses the destination"
+                " directly, so combining it with session or any Slack option"
+                " (channel, user, blocks, thread_ts, reply_broadcast, unfurl_*) is"
+                " REFUSED, not silently ignored."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "channel_type": {
+                        "type": "string",
+                        "description": (
+                            "Non-Slack channel to deliver to (e.g. 'webex'). Requires "
+                            "target_id. The channel must be connected and able to "
+                            "start a conversation."
+                        ),
+                    },
+                    "target_id": {
+                        "type": "string",
+                        "description": (
+                            "Opaque configured-destination id for channel_type "
+                            "(e.g. 'user:someone@example.com'). Requires channel_type."
+                        ),
+                    },
                     "text": {
                         "type": "string",
                         "description": "Message text. Also used as fallback when blocks are provided.",
@@ -309,6 +333,10 @@ def send_message(name: str, args: dict[str, Any]) -> str:
     payload = {"text": text, "title": title}
     if args.get("blocks"):
         payload["blocks"] = args["blocks"]
+    if args.get("channel_type"):
+        payload["channel_type"] = args["channel_type"]
+    if args.get("target_id"):
+        payload["target_id"] = args["target_id"]
     if args.get("channel"):
         payload["channel"] = args["channel"]
     if args.get("user"):
@@ -323,6 +351,10 @@ def send_message(name: str, args: dict[str, Any]) -> str:
         payload["reply_broadcast"] = args["reply_broadcast"]
     if session:
         payload["session"] = session
+    # Whether this send names its own destination (channel_type + target_id). Read
+    # twice below -- by the identity block and by the governance ladder -- so it is
+    # derived once here from the PAYLOAD, which is what the gateway will route on.
+    addressed_target = str(payload.get("channel_type") or "")
     # Always tell the gateway when the caller is a cron — even on a bare
     # send (no session/channel) — so it can apply the documented
     # "cron → Slack DM by default" routing and report where the message
@@ -338,8 +370,38 @@ def send_message(name: str, args: dict[str, Any]) -> str:
     if _chan_deny:
         return _chan_deny
     is_cron = caller_session.startswith("cron:")
-    if is_cron:
-        payload["caller_session"] = caller_session
+    # Forward the VERIFIED caller identity (from ``_resolve_session_key``, never a
+    # tool arg) so the gateway's fail-CLOSED ``channels`` re-vet resolves the
+    # caller's OWN profile. Filtering to cron left every non-cron caller re-vetted
+    # at the gateway as ``HOST_SESSION_KEY`` -- a permissive default that, paired
+    # with this module's fail-OPEN channel vet (``_vet_channel_governance`` returns
+    # None on an evaluation error), let a caller whose own profile denies the
+    # transport reach a host-permitted target.
+    #
+    # STRICT resolution, not the lenient key above, because this value becomes the
+    # governance SUBJECT at the egress chokepoint. The lenient resolver walks
+    # process ancestors, so a sub-agent whose identity was not injected resolves to
+    # its PARENT -- and forwarding that would hand the child the parent's channel
+    # permissions. Strict accepts only the gateway-injected key or an HMAC-verified
+    # pid, which is what makes it safe to authorize on. Cron is unaffected: its key
+    # arrives through that same injection.
+    #
+    # The gateway ignores a non-cron key for ROUTING (``is_cron_caller`` stays
+    # False and ``_resolve_session_target`` only acts on ``origin``), so this only
+    # sharpens the governance identity.
+    authoritative_session = mcp_core._resolve_session_key_strict()
+    if authoritative_session:
+        payload["caller_session"] = authoritative_session
+    elif addressed_target:
+        # A channel-ADDRESSED send names its own destination, so there is no
+        # benign default to fall back to: the gateway would vet it as the host,
+        # which is exactly the permissive identity this block exists to avoid.
+        # Refuse rather than send under a borrowed one.
+        return (
+            "Error: cannot verify caller identity for a channel-addressed send "
+            "(no gateway-injected session key or HMAC-verified pid). Refusing "
+            "rather than egressing under the host's permissions."
+        )
     # Governance: outbound messaging is a capability gate (exfil surface).
     # A policy/profile may disable proactive messaging for a surface/app.
     _gov_msg = mcp_core._vet_messaging_governance(caller_session)
@@ -348,23 +410,34 @@ def send_message(name: str, args: dict[str, Any]) -> str:
     # Governance: the per-transport ``channels`` allowlist is finer-grained
     # than the on/off messaging gate — a policy may permit messaging but
     # restrict it to specific transports (e.g. Slack only). Vet the ONE
-    # transport this send actually egresses on.
+    # transport this send actually egresses on, in the SAME order the gateway
+    # routes it (``messaging.api_send_message``) -- a predicate that disagrees with
+    # the router vets a surface the message never reaches while the one it does
+    # reach goes ungated:
     #
-    # The gateway routes a send to Slack whenever session=="slack" OR an
-    # explicit channel/user is set OR the caller is a cron (see
-    # messaging.api_send_message), so we mirror that exact predicate here:
-    # checking only session=="slack" would let a channel=/user=-addressed send
-    # reach Slack while bypassing the gate. A channel session takes that routing
-    # over, including the cron default, so it is vetted on its own transport and
-    # never additionally on Slack: vetting Slack too would let a Slack-denying
-    # policy block a Discord DM that never touches Slack. A bare send (no
-    # session/channel/user, non-cron) is the in-process dashboard notification
-    # path, governed by the messaging gate above.
+    # 1. ``channel_type`` + ``target_id`` is the most specific address and the
+    #    gateway returns on it first, so it wins here too. Vetting the literal
+    #    "slack" for a Webex send would check a policy that has nothing to do with
+    #    the surface the message actually reaches.
+    # 2. A ``_CHANNEL_SESSIONS`` value takes the Slack routing over, including the
+    #    cron default, so it is vetted on its own transport and never additionally
+    #    on Slack: vetting Slack too would let a Slack-denying policy block a
+    #    Discord DM that never touches Slack.
+    # 3. Otherwise Slack, whenever session=="slack" OR an explicit channel/user is
+    #    set OR the caller is a cron. Checking only session=="slack" would let a
+    #    channel=/user=-addressed send reach Slack while bypassing the gate.
+    # 4. A bare send (no address, no session/channel/user, non-cron) is the
+    #    in-process dashboard notification path, governed by the messaging gate
+    #    above.
     #
     # Defence in depth, not the authority: the gateway re-vets the same
     # ``channels`` scope fail-closed at the egress chokepoint, which is where a
-    # denial is decided (this one degrades open on an evaluation error).
-    if session in _CHANNEL_SESSIONS:
+    # denial is decided (this one degrades open on an evaluation error). Being the
+    # earlier of the two is what keeps a denied send from opening a remote DM,
+    # since resolving a target is itself a visible side effect on some channels.
+    if addressed_target:
+        egress_transport = addressed_target
+    elif session in _CHANNEL_SESSIONS:
         egress_transport = session
     elif session == "slack" or bool(payload.get("channel")) or bool(payload.get("user")) or is_cron:
         egress_transport = "slack"
@@ -377,6 +450,15 @@ def send_message(name: str, args: dict[str, Any]) -> str:
     resp = mcp_core._post("/api/send-message", payload)
     if not resp.get("ok"):
         return f"Failed: {resp}"
+    # The channel-addressed leg posts ONLY to the named target and publishes no
+    # dashboard notification, and its target may be a room rather than a DM, so it
+    # cannot borrow the DM-leg's "DM + notification" string below (that leg always
+    # notifies first and only ever targets the owner's DM). Report what actually
+    # happened, keyed off the pair this call sent.
+    if payload.get("channel_type"):
+        parts = resp.get("parts", 1)
+        suffix = "" if parts == 1 else f" ({parts} parts)"
+        return f"Message sent to {payload['channel_type']} target {payload.get('target_id', '')}{suffix}."
     # Prefer the gateway's explicit delivery channel when present
     # (delivered_to ∈ {"slack", "session", "notification"} or a channel type);
     # fall back to the legacy slack/session booleans for older gateways.

@@ -44,7 +44,13 @@ PROACTIVE_CHANNEL = "weixin"
 def _fake_transport(channel_type: str = "telegram", proactive: bool = True):
     return SimpleNamespace(
         channel_type=channel_type,
-        capabilities=SimpleNamespace(supports_proactive_send=proactive, max_message_chars=4096),
+        capabilities=SimpleNamespace(
+            supports_proactive_send=proactive,
+            max_message_chars=4096,
+            # 0 = not byte-capped, so chunk_for_transport takes the character
+            # path these tests are about. Webex is the byte-capped one.
+            max_message_bytes=0,
+        ),
         send_message=AsyncMock(return_value="mid-1"),
     )
 
@@ -274,6 +280,37 @@ class TestDeliverCrossSurfaceReply:
             return_value=ChannelLink("telegram", channel_id="123")
         )
         await _deliver_cross_surface_reply(state, "k", "hi")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_a_byte_capped_channel_chunks_on_BYTES(self, tmp_path):
+        """The mirror leg measures in the transport's own unit.
+
+        A character count cannot express a byte cap without being wrong in one
+        direction: the only safe char value is the byte budget over four, which
+        cut an ASCII reply into quarters, while the true char cap would let a CJK
+        reply exceed the byte limit and be truncated on send.
+        """
+        state = _make_state(tmp_path)
+        tp = _fake_transport("webex")
+        # What Webex declares: a byte cap plus the 4x-pessimistic char floor.
+        tp.capabilities.max_message_bytes = 400
+        tp.capabilities.max_message_chars = 100
+        state.register_channel_transport(tp)
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink("webex", channel_id="ROOM")
+        )
+
+        # 350 ASCII chars is 350 bytes: under the byte cap, so ONE send — where
+        # the char floor alone would have made it four.
+        await _deliver_cross_surface_reply(state, "k", "x" * 350)
+        assert tp.send_message.await_count == 1
+
+        # The same length in 3-byte characters is 1050 bytes, so it must split.
+        tp.send_message.reset_mock()
+        await _deliver_cross_surface_reply(state, "k", "界" * 350)
+        assert tp.send_message.await_count > 1
+        for call in tp.send_message.await_args_list:
+            assert len(call.args[1].encode("utf-8")) <= 400
 
     @pytest.mark.asyncio
     async def test_long_reply_is_chunked(self, tmp_path):

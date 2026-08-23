@@ -2375,10 +2375,73 @@ FILE_WRITE_SCHEMA = ToolSchema(
     ],
 )
 
+# Non-Slack channel routing for send_message. `validate_tool_args` REJECTS an
+# unknown field, so a property advertised in the MCP inputSchema but missing here
+# is not merely unvalidated — the whole call fails, and the capability is 0%
+# reachable over MCP. The two must be added together.
+#
+# The channel is matched by SHAPE, not against an enumeration: the authoritative
+# set is which transports are registered and what channels governance permits,
+# both checked at send time, and a literal list here would be a second copy that
+# goes stale the moment a channel is added.
+_CHANNEL_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
+# A configured-destination id is opaque and channel-defined — a Webex room id is
+# a ~90-char base64 Hydra blob — so this bounds length and excludes control
+# characters and whitespace rather than pretending to know the grammar. The id is
+# re-resolved against the channel's own configured targets before any send, which
+# is what actually authorizes it.
+_TARGET_ID_RE = re.compile(r"^[\x21-\x7e]{1,512}$")
+
+
+# Fields that select or shape a SLACK delivery. Combined with the
+# ``channel_type``/``target_id`` pair — which addresses a non-Slack destination
+# directly — they have no destination, so the pair's handler drops them before
+# any Slack-shaped validation runs. Refused here at the boundary rather than
+# dropped, because the caller (including the model) cannot observe a drop and
+# would read a private channel DM as a threaded post to a named Slack channel.
+_CHANNEL_TARGET_INCOMPATIBLE = (
+    "channel",
+    "user",
+    "blocks",
+    "thread_ts",
+    "reply_broadcast",
+    "unfurl_links",
+    "unfurl_media",
+    "session",
+)
+
+
+def _validate_channel_routing(cleaned: dict[str, Any]) -> None:
+    """``channel_type`` and ``target_id`` are meaningful only as a PAIR.
+
+    Rejected at the boundary rather than ignored downstream: one without the
+    other is an under-specified send, and silently falling back to the default
+    Slack/dashboard destination would deliver the message somewhere the caller
+    did not name. For the same reason a Slack-routing field travelling with the
+    pair is refused, not dropped: the pair wins the routing, so the field would
+    reach nothing.
+    """
+    has_channel = bool(cleaned.get("channel_type"))
+    has_target = bool(cleaned.get("target_id"))
+    if has_channel != has_target:
+        missing = "target_id" if has_channel else "channel_type"
+        raise ValidationError(missing, "channel_type and target_id must be given together")
+    if has_channel:
+        stray = [f for f in _CHANNEL_TARGET_INCOMPATIBLE if cleaned.get(f) is not None]
+        if stray:
+            raise ValidationError(
+                stray[0],
+                "channel_type/target_id addresses the destination directly and cannot be "
+                f"combined with the Slack-routing field(s): {', '.join(stray)}",
+            )
+
+
 SEND_MESSAGE_SCHEMA = ToolSchema(
     tool_name="send_message",
     fields=[
         FieldSpec("text", str, required=True, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("channel_type", str, max_len=32, pattern=_CHANNEL_TYPE_RE),
+        FieldSpec("target_id", str, max_len=512, pattern=_TARGET_ID_RE),
         FieldSpec("title", str, max_len=MAX_SHORT_STRING),
         FieldSpec("blocks", list, item_type=dict, max_items=50),
         FieldSpec("channel", str, max_len=CHANNEL_MAX_LEN, pattern=CHANNEL_ID_RE),
@@ -2400,6 +2463,7 @@ SEND_MESSAGE_SCHEMA = ToolSchema(
         ),
         FieldSpec("caller_session", str, max_len=MAX_SHORT_STRING, pattern=CRON_SESSION_RE),
     ],
+    custom_validator=_validate_channel_routing,
 )
 
 SEND_NOTIFICATION_SCHEMA = ToolSchema(

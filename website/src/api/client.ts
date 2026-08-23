@@ -464,6 +464,17 @@ export interface WebexConfigData {
   bot_token_preview: string
   enabled: boolean
   allowed_emails: string[]
+  /** Answer in group spaces as well as DMs. Off by default: a reply in a space is
+   *  visible to every member, including people not on the email allow-list. */
+  allow_group_rooms: boolean
+  /** Spaces the bot may answer in. Empty = deny all, so the switch alone grants nothing. */
+  allowed_room_ids: string[]
+  /** Reply under the message's own thread when it has one. */
+  reply_in_thread: boolean
+  /** Context % at which the bot suggests /compact instead of auto-compacting. */
+  soft_threshold_pct: number
+  /** Context % at which it force-compacts so the window never overflows. */
+  hard_threshold_pct: number
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }
@@ -474,6 +485,11 @@ export interface WebexConfigSave {
   bot_token_clear: boolean
   enabled: boolean
   allowed_emails: string[]
+  allow_group_rooms: boolean
+  allowed_room_ids: string[]
+  reply_in_thread: boolean
+  soft_threshold_pct: number
+  hard_threshold_pct: number
   /** Sidebar folder this channel's sessions are filed into ("" = off, the default). */
   session_folder?: string
 }

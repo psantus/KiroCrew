@@ -5998,6 +5998,52 @@ class WebexConfig:
             tags=["webex"],
         ),
     )
+    allow_group_rooms: bool = field(
+        default=False,
+        metadata=_meta(
+            "Allow Group Spaces",
+            "Answer in group spaces as well as direct messages. Off by default: a "
+            "reply in a space is visible to every member, including people who are "
+            "not on the allow-list, so tool output would leave the DM. A Webex bot "
+            "only ever sees messages that @mention it in a space.",
+            tags=["webex"],
+        ),
+    )
+    allowed_room_ids: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Allowed Room IDs",
+            "Webex space IDs the bot may answer in when group spaces are enabled. "
+            "Empty = deny all (fail closed), so turning the switch on alone grants "
+            "nothing; the sender must ALSO be on the email allow-list.",
+            tags=["webex"],
+        ),
+    )
+    reply_in_thread: bool = field(
+        default=True,
+        metadata=_meta(
+            "Reply in Thread",
+            "Reply under the message's own thread when it has one, keeping a space "
+            "readable. Webex threads are flat, so a reply always attaches to the "
+            "thread root.",
+            tags=["webex"],
+        ),
+    )
+    wdm_base: str = field(
+        default="",
+        metadata=_meta(
+            "Device Manager Base URL",
+            "Override the Webex Device Manager host used for the inbound "
+            "WebSocket. Empty (the default) discovers the org's own regional host "
+            "per token, which is what a non-US-resident org needs; set this only "
+            "to pin a REGIONAL WEBEX host for a network that reaches it but not "
+            "the service catalog. Must be an https Webex host (*.wbx2.com, "
+            "*.webex.com, *.ciscospark.com) — the bot token rides device "
+            "registration, so anything else is refused and discovery is used "
+            "instead. An outbound proxy belongs in HTTPS_PROXY, not here.",
+            tags=["webex"],
+        ),
+    )
     soft_threshold_pct: int = field(
         default=80,
         metadata=_meta(
@@ -7159,6 +7205,20 @@ class KiroCrewConfig:
                     if isinstance(webex_data.get("allowed_emails", []), list)
                     else []
                 ),
+                # Group spaces are a SECURITY decision, so the read is as explicit
+                # as the write: a field the loader forgets is not merely lost, it
+                # silently reverts to the safe default on the next restart while
+                # the settings panel keeps showing the saved value it read from
+                # config.json — the operator sees an enabled space allow-list and
+                # the gateway answers nobody.
+                allow_group_rooms=bool(webex_data.get("allow_group_rooms", False)),
+                allowed_room_ids=[
+                    r
+                    for r in _safe_list(webex_data.get("allowed_room_ids"))
+                    if isinstance(r, str) and r
+                ],
+                reply_in_thread=bool(webex_data.get("reply_in_thread", True)),
+                wdm_base=str(webex_data.get("wdm_base", "") or ""),
                 soft_threshold_pct=_threshold_pct(webex_data.get("soft_threshold_pct"), 80),
                 hard_threshold_pct=_threshold_pct(webex_data.get("hard_threshold_pct"), 95),
             ),

@@ -187,7 +187,7 @@ from kiro_crew.mcp_discovery import kirocrew_managed_names
 from kiro_crew.members import record_activity
 from kiro_crew.messaging.identity import publish_turn_identity
 from kiro_crew.messaging.link import SLACK_NAMESPACE, telemetry_channel_of
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.renderer import chunk_for_transport
 from kiro_crew.metrics.events import TURN_TIMEOUT_CAUSE, emit_counter
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.platform import redact_via_context
@@ -2929,13 +2929,14 @@ async def _deliver_cross_surface_reply(state: Any, session_key: str, assistant_t
     # rather than being hard-truncated by the transport (Telegram caps at 4096,
     # and its client slices at that width), matching the Slack leg's chunking.
     #
-    # Fence-safe, not fixed-width: a blind slice through a code block leaves part
-    # two with no opener, so every line in it reads as prose and a channel's
-    # dialect converter rewrites the `**`, `#` and `- ` INSIDE the code. Cron log
-    # and diff dumps are exactly that shape. The shared splitter seals each chunk
-    # with a synthetic closer and reopens the next with the original opener line,
-    # so each part stands alone and no channel needs to re-derive it.
-    parts = split_markdown_safe(text, transport.capabilities.max_message_chars)
+    # ``chunk_for_transport`` measures in the transport's OWN unit -- bytes for a
+    # byte-capped channel (Webex), chars otherwise -- and is fence-safe on both
+    # paths: a blind slice through a code block leaves part two with no opener, so
+    # every line in it reads as prose and a channel's dialect converter rewrites
+    # the `**`, `#` and `- ` INSIDE the code. Cron log and diff dumps are exactly
+    # that shape. The shared splitter seals each chunk with a synthetic closer and
+    # reopens the next with the original opener line, so each part stands alone.
+    parts = chunk_for_transport(text, transport.capabilities)
     try:
         for part in parts:
             await transport.send_message(link.channel_id, part, thread_id=link.thread_id)

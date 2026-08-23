@@ -194,7 +194,7 @@ from kiro_crew.messaging.link import (
     channel_namespace_of,
     parse_session_key,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.renderer import chunk_for_transport
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.platform import boot_platform
 from kiro_crew.platform.context import (
@@ -2813,14 +2813,19 @@ class GatewayOrchestrator:
             # literal-only scan here let a markdown-collapse credential
             # (`AKIA**...**`, which the client renders whole) reach the channel,
             # and every caller inherits the gap rather than each one carrying it.
+            # ``redact_via_context`` stays the redactor rather than the neutral
+            # ``display_safe``: it is context-aware, and the shared sink's default
+            # pair would silently drop that.
             safe_text, _ = redact_for_display(text, redact_via_context)
-            # Fence-safe, not fixed-width: a blind slice through a code block
-            # leaves part two with no opener, so every line in it reads as prose
-            # and a channel's dialect converter rewrites the `**`, `#` and `- `
-            # INSIDE the code. A sub-agent's diff or log dump is exactly that
-            # shape. The shared splitter seals each chunk with a synthetic closer
-            # and reopens the next with the original opener line.
-            parts = split_markdown_safe(safe_text, transport.capabilities.max_message_chars)
+            # ``chunk_for_transport``: the transport's OWN unit (bytes for a
+            # byte-capped channel like Webex, chars otherwise) and fence-safe on
+            # both paths. A blind slice through a code block leaves part two with
+            # no opener, so every line reads as prose and a channel's dialect
+            # converter rewrites the `**`, `#` and `- ` INSIDE the code -- a
+            # sub-agent's diff or log dump is exactly that shape. The shared
+            # splitter seals each chunk with a synthetic closer and reopens the
+            # next with the original opener line.
+            parts = chunk_for_transport(safe_text, transport.capabilities)
             for part in parts:
                 # A transport signals a refused or exhausted send with an EMPTY
                 # message id rather than an exception (`send_message` ends in
@@ -5330,6 +5335,89 @@ class GatewayOrchestrator:
             logger.exception("AutoNudge: discord nudge failed for %s (loop %s)", key, loop.id)
             return False
 
+    async def _fire_webex_nudge(self, loop: NudgeLoop) -> bool:
+        """Drive one unattended nudge turn in a Webex DM session.
+
+        Sibling of :meth:`_fire_discord_nudge`, with the same four guards and for
+        the same reasons: a synthetic injection bypasses ``transport.receive``, so
+        authorization, the generation check and the busy check are this caller's
+        responsibility rather than the transport's.
+
+        The nudge is routed through the dispatcher — the exact path a real DM
+        takes — so queue/steer handling, rendering, byte-safe chunking and
+        persistence all behave like a user turn. ``interpret_commands=False``
+        keeps the nudge text from being parsed as a ``/command``.
+        """
+        key = loop.slot_key
+        transports = getattr(self.dashboard_state, "channel_transports", None) or {}
+        transport = transports.get("webex")
+        dispatcher = transport.dispatcher if transport is not None else None
+        if transport is None or dispatcher is None:
+            logger.info("AutoNudge skip: webex transport not running (loop %s)", loop.id)
+            return False
+        # Key shape: webex:{agent}:direct:{email}[:genN]
+        parts = key.split(":")
+        if len(parts) < 4 or parts[2] != "direct":
+            logger.warning("AutoNudge: unsupported webex key %s — removing loop %s", key, loop.id)
+            if self.autonudge_svc:
+                await self.autonudge_svc.remove(loop.id)
+            return False
+        email = parts[3]
+        # Defence in depth: the create endpoint checks the allow-list too, but it
+        # can shrink after a loop was created, and a synthetic turn never passes
+        # through the transport's own gate.
+        if not transport.is_authorized(email):
+            logger.warning("AutoNudge: webex user not authorized — removing loop %s", loop.id)
+            if self.autonudge_svc:
+                await self.autonudge_svc.remove(loop.id)
+            return False
+        # Generation guard: a `/new` mints a new key, and firing into the rotated
+        # one would run in a fresh session with none of the loop's context — and
+        # an `autonudge_stop` from that session could never find this loop.
+        try:
+            current_key = dispatcher.current_session_key(email)
+        except Exception:
+            current_key = key
+        if current_key != key:
+            logger.info("AutoNudge: webex session rotated — removing loop %s", loop.id)
+            if self.autonudge_svc:
+                await self.autonudge_svc.remove(loop.id)
+            return False
+        sessions = getattr(dispatcher, "sessions", None)
+        if sessions is not None and sessions.is_busy(key):
+            logger.info("AutoNudge skip: webex session busy (loop %s)", loop.id)
+            return False
+        # The SHARED fire-path composer, same as the slack/discord/dashboard
+        # adapters: it applies the {{STOP_FILE}} substitution and prefixes the
+        # session's durable work-ledger snapshot, so a Webex loop starts each cycle
+        # from that state rather than from transcript memory. Calling the bare
+        # template substitution instead would silently opt this channel out of the
+        # ledger — the one feature whose whole point is surviving context loss.
+        msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
+        tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+        # Imported HERE, not at module scope: this file is on the gateway boot
+        # path, and it deliberately keeps every channel client behind
+        # TYPE_CHECKING so enabling one channel does not cost every launch the
+        # import of all of them. Reached only when a Webex loop actually fires.
+        from kiro_crew.webex.client import WebexInbound
+
+        try:
+            room_id = await transport.resolve_conversation(email)
+            synthetic = WebexInbound(
+                person_email=email,
+                room_id=room_id,
+                text=tagged,
+                room_type="direct",
+            )
+            await asyncio.wait_for(
+                dispatcher.handle_message(synthetic, interpret_commands=False),
+                timeout=_NUDGE_TURN_TIMEOUT,
+            )
+            return True
+        except Exception:
+            logger.exception("AutoNudge: webex nudge failed (loop %s)", loop.id)
+            return False
+
     async def _fire_dashboard_nudge(self, loop: NudgeLoop) -> bool:
         """Drive one nudge turn in a dashboard chat slot.
 
@@ -5483,6 +5571,8 @@ class GatewayOrchestrator:
                     return await self._fire_slack_nudge(loop)
                 if loop.slot_key.startswith("discord:"):
                     return await self._fire_discord_nudge(loop)
+                if loop.slot_key.startswith("webex:"):
+                    return await self._fire_webex_nudge(loop)
                 logger.warning(
                     "AutoNudge: unsupported channel key %s — removing loop %s",
                     loop.slot_key,

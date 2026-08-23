@@ -90,7 +90,14 @@ class TestSendMessageCronSession:
         monkeypatch.setattr("kiro_crew.mcp_core._vet_channel_governance", lambda _sk, _t: None)
 
     def test_default_notification_only(self):
-        """Non-cron bare send_message(text=...) → no session in payload, notification only."""
+        """Non-cron bare send_message(text=...) → no routing session, notification only.
+
+        ``caller_session`` IS forwarded — it carries the verified caller identity
+        so the gateway's fail-closed channels re-vet resolves the caller's own
+        profile rather than a permissive host default. A non-cron key does not
+        trigger cron routing (the gateway matches ``cron:`` for that), so this
+        stays notification-only.
+        """
         with patch("kiro_crew.mcp_core._post") as mock_post, patch.dict(
             "os.environ", {"KIROCREW_SESSION_KEY": "dashboard:chat-1"}
         ):
@@ -99,7 +106,7 @@ class TestSendMessageCronSession:
 
             payload = mock_post.call_args[0][1]
             assert "session" not in payload
-            assert "caller_session" not in payload
+            assert payload["caller_session"] == "dashboard:chat-1"
             assert "Notification delivered" in result
 
     def test_cron_bare_send_attaches_caller_session(self):

@@ -4954,6 +4954,10 @@
         "enabled": false,
         "bot_token": "",
         "allowed_emails": [],
+        "allow_group_rooms": false,
+        "allowed_room_ids": [],
+        "reply_in_thread": true,
+        "wdm_base": "",
         "soft_threshold_pct": 80,
         "hard_threshold_pct": 95,
         "session_folder": ""
@@ -5020,6 +5024,84 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": null
+    },
+    {
+      "path": "webex.allow_group_rooms",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "webex"
+      ],
+      "label": "Allow Group Spaces",
+      "help": "Answer in group spaces as well as direct messages. Off by default: a reply in a space is visible to every member, including people who are not on the allow-list, so tool output would leave the DM. A Webex bot only ever sees messages that @mention it in a space.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "webex.allowed_room_ids",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "webex"
+      ],
+      "label": "Allowed Room IDs",
+      "help": "Webex space IDs the bot may answer in when group spaces are enabled. Empty = deny all (fail closed), so turning the switch on alone grants nothing; the sender must ALSO be on the email allow-list.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "webex.allowed_room_ids.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "webex.reply_in_thread",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "webex"
+      ],
+      "label": "Reply in Thread",
+      "help": "Reply under the message's own thread when it has one, keeping a space readable. Webex threads are flat, so a reply always attaches to the thread root.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
+    },
+    {
+      "path": "webex.wdm_base",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "webex"
+      ],
+      "label": "Device Manager Base URL",
+      "help": "Override the Webex Device Manager host used for the inbound WebSocket. Empty (the default) discovers the org's own regional host per token, which is what a non-US-resident org needs; set this only to pin a REGIONAL WEBEX host for a network that reaches it but not the service catalog. Must be an https Webex host (*.wbx2.com, *.webex.com, *.ciscospark.com) — the bot token rides device registration, so anything else is refused and discovery is used instead. An outbound proxy belongs in HTTPS_PROXY, not here.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
     },
     {
       "path": "webex.soft_threshold_pct",

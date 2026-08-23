@@ -5939,7 +5939,11 @@ class TestSubagentChannelTransportDelivery:
         return SimpleNamespace(
             channel_type=channel_type,
             capabilities=SimpleNamespace(
-                supports_proactive_send=proactive, max_message_chars=max_chars
+                supports_proactive_send=proactive,
+                max_message_chars=max_chars,
+                # 0 = not byte-capped; the byte path is Webex's and is covered
+                # by test_messaging_split.py.
+                max_message_bytes=0,
             ),
             send_message=AsyncMock(return_value="mid-1"),
             resolve_configured_target=AsyncMock(side_effect=_identity_target),
