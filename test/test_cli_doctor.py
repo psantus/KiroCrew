@@ -914,13 +914,17 @@ class TestSourceCheckout:
     def test_git_line_pins_git_and_returns_none_when_untrusted(
         self, monkeypatch, tmp_path
     ) -> None:
-        """git resolves via trusted_system_bin; a miss means no subprocess at all.
+        """git resolves via trusted_git_bin; a miss means no subprocess at all.
 
         Doctor runs with operator privileges, so a ``git`` shim planted in an
         agent-writable PATH directory must never execute: when the trusted
-        resolver declines, _git_line collapses to None without spawning.
-        When it resolves, the pinned absolute path — not the bare name — is
-        what reaches argv[0].
+        resolver declines, _git_line collapses to None without spawning. When it
+        resolves, the pinned absolute path -- not the bare name -- reaches argv[0].
+
+        The resolver itself (system dirs plus the Windows install-root fallback)
+        is tested in `test_platform_compat`; this asserts what the doctor does
+        with each OUTCOME, which is why it patches the resolver rather than the
+        directories behind it.
         """
         import subprocess as _sp
 
@@ -932,82 +936,17 @@ class TestSourceCheckout:
 
         monkeypatch.setattr(cli_doctor.subprocess, "run", fake_run)
 
-        # Miss: no trusted git -> None, and no process spawned. Neutralize
-        # the Windows fallback too so the miss is a miss on every platform
-        # (on a real Windows runner _windows_git_bin finds the actual Git
-        # for Windows install; the fallback has its own dedicated test).
-        monkeypatch.setattr(
-            cli_doctor.platform_compat, "trusted_system_bin", lambda _n: None
-        )
-        monkeypatch.setattr(cli_doctor, "_windows_git_bin", lambda: None)
+        # Miss: no trusted git -> None, and no process spawned.
+        monkeypatch.setattr(cli_doctor.platform_compat, "trusted_git_bin", lambda: None)
         assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") is None
         assert calls == []
 
         # Hit: the resolved absolute path is argv[0], never the bare "git".
         monkeypatch.setattr(
-            cli_doctor.platform_compat,
-            "trusted_system_bin",
-            lambda _n: "/usr/bin/git",
+            cli_doctor.platform_compat, "trusted_git_bin", lambda: "/usr/bin/git"
         )
         assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") == "main"
         assert calls and calls[0][0] == "/usr/bin/git"
-
-    def test_git_line_windows_falls_back_to_git_for_windows_roots(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        """On Windows a system-dirs miss probes the fixed Git for Windows roots.
-
-        Git for Windows installs under Program Files, never System32, so
-        without the fallback every supported Windows source install reported
-        "could not check". The fallback stays pinned: fixed literal roots, and
-        a miss there still means no subprocess.
-        """
-        import subprocess as _sp
-
-        calls: list[list[str]] = []
-
-        def fake_run(argv, *a, **k):
-            calls.append(list(argv))
-            return _sp.CompletedProcess(argv, 0, stdout="main\n", stderr="")
-
-        monkeypatch.setattr(cli_doctor.subprocess, "run", fake_run)
-        monkeypatch.setattr(
-            cli_doctor.platform_compat, "trusted_system_bin", lambda _n: None
-        )
-        monkeypatch.setattr(cli_doctor.platform_compat, "IS_WINDOWS", True)
-
-        gfw = r"C:\Program Files\Git\cmd\git.exe"
-        monkeypatch.setattr(cli_doctor, "_windows_git_bin", lambda: gfw)
-        assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") == "main"
-        assert calls and calls[0][0] == gfw
-
-        # Fallback miss: still no spawn at all.
-        calls.clear()
-        monkeypatch.setattr(cli_doctor, "_windows_git_bin", lambda: None)
-        assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") is None
-        assert calls == []
-
-    def test_git_line_non_windows_never_probes_git_for_windows(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        # POSIX resolver miss must not consult the Windows fallback: the
-        # trusted-dirs decision is final there.
-        monkeypatch.setattr(
-            cli_doctor.platform_compat, "trusted_system_bin", lambda _n: None
-        )
-        monkeypatch.setattr(cli_doctor.platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(
-            cli_doctor,
-            "_windows_git_bin",
-            lambda: (_ for _ in ()).throw(AssertionError("probed on POSIX")),
-        )
-        assert cli_doctor._git_line(tmp_path, "rev-parse", "HEAD") is None
-
-    def test_windows_git_bin_returns_none_when_roots_empty(self, monkeypatch) -> None:
-        # Fixed roots only — a miss returns None without consulting PATH or
-        # the environment.
-        monkeypatch.setattr(cli_doctor, "_WINDOWS_GIT_DIRS", ("Z:\\nonexistent\\Git\\cmd",))
-        assert cli_doctor._windows_git_bin() is None
 
 
 class TestCliInstallerResidue:

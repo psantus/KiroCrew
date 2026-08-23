@@ -3795,3 +3795,62 @@ class TestKillPidPinned:
 
         assert pc.kill_pid_pinned(4321, "777", pc.SIGTERM) is True
         assert killed == [(4321, pc.SIGTERM)]
+
+
+class TestTrustedGitBin:
+    """`git` resolution for privileged/unattended callers.
+
+    Moved here from `test_cli_doctor` with the logic: the doctor and the update
+    seam are two callers of one resolver, so the resolution rules belong beside
+    the resolver rather than in either caller's tests.
+    """
+
+    def test_uses_the_trusted_system_resolver(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            pc, "trusted_system_bin", lambda _n: "/usr/bin/git"
+        )
+        assert pc.trusted_git_bin() == "/usr/bin/git"
+
+    def test_windows_falls_back_to_the_git_for_windows_roots(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Git for Windows installs under Program Files, never System32.
+
+        Without the fallback every supported Windows source install resolves to
+        None, which would silently disable the callers that depend on it.
+        """
+        monkeypatch.setattr(pc, "trusted_system_bin", lambda _n: None)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+
+        gfw = tmp_path / "Git" / "cmd"
+        gfw.mkdir(parents=True)
+        exe = gfw / "git.exe"
+        exe.write_text("")
+        exe.chmod(0o755)
+        monkeypatch.setattr(pc, "_WINDOWS_GIT_DIRS", (str(gfw),))
+        assert pc.trusted_git_bin() == str(exe)
+
+    def test_windows_returns_none_when_the_roots_are_empty(self, monkeypatch) -> None:
+        """Fixed roots only -- a miss returns None without consulting PATH.
+
+        Reading `%ProgramFiles%` instead would let a poisoned variable redirect
+        the lookup to an agent-writable directory, which is the hole the pin
+        exists to close.
+        """
+        monkeypatch.setattr(pc, "trusted_system_bin", lambda _n: None)
+        monkeypatch.setattr(pc, "IS_WINDOWS", True)
+        monkeypatch.setattr(
+            pc, "_WINDOWS_GIT_DIRS", (r"Z:\nonexistent\Git\cmd",)
+        )
+        assert pc.trusted_git_bin() is None
+
+    def test_posix_never_probes_the_windows_roots(self, monkeypatch) -> None:
+        """On POSIX the trusted-dirs decision is final."""
+        monkeypatch.setattr(pc, "trusted_system_bin", lambda _n: None)
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(
+            pc,
+            "_WINDOWS_GIT_DIRS",
+            property(lambda _s: (_ for _ in ()).throw(AssertionError("probed on POSIX"))),
+        )
+        assert pc.trusted_git_bin() is None

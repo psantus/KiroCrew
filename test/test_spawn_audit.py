@@ -969,13 +969,16 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "mcp_gateway/gatewayd.py::main",
         "mcp_gateway/manager.py::_spawn_once",
         "mcp_gateway/stub.py::main",
-        # Read-only `git config` / `git ls-remote --get-url` resolving which
-        # remote the update would fetch from, for the `updates.source` pin. Fixed
-        # list-argv (no shell=True), no agent input: the branch lands mid-key
+        # The update seam's one read-only git chokepoint: `git config` (the
+        # `updates.source` pin's remote, the repo-driver probe, and which remote a
+        # branch tracks) and `git ls-remote --get-url`. Fixed list-argv (no
+        # shell=True), no agent input: the branch lands mid-key
         # (`branch.<x>.remote`) so it cannot lead with a dash, and the remote
         # name — which is read out of git config and COULD — is passed after
         # `--`. Must NOT be sandboxed: it reads the real checkout's git metadata.
-        "platform/update_governance.py::_git",
+        # It does carry `git_neutralizer_env()`, so repo config cannot make these
+        # reads exec a program (`core.fsmonitor` and friends are pinned).
+        "platform/update_governance.py::_git_probe",
         # Read-only `git rev-parse --show-toplevel` deciding whether the install
         # root IS a working tree. Fixed list-argv (no shell=True); the only
         # variable is the path, which comes from KIROCREW_PROJECT_DIR — an

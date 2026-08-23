@@ -214,6 +214,15 @@ from kiro_crew.platform.update_capability import (
     CHECK_UNCHECKED,
     EXTERNALLY_MANAGED_STAMPS,
 )
+from kiro_crew.platform.update_governance import (
+    commits_ahead,
+    git_command_env,
+    is_primary_branch,
+    repo_exec_config_reason,
+    resolve_remote_url,
+    tracks_upstream,
+    update_blocked_reason,
+)
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import safety_override
 from kiro_crew.sandbox import ensure_agents_slice_limits, warm_backend
@@ -8517,13 +8526,53 @@ class GatewayOrchestrator:
         if not proj:
             return
         try:
+            # Every git call below reads a tree an agent can write, and several of
+            # them (`status`, `diff`, `reset`) will EXEC a program the repository
+            # names in its own config. Bound once here, ahead of the first spawn,
+            # so the whole sequence is covered and a later-added command cannot
+            # quietly opt out of it.
+            #
+            # A redirected work tree is handled separately, by the
+            # `repo_exec_config_reason` refusal below: git ignores a
+            # `core.worktree` supplied through the environment, so it cannot be
+            # pinned here.
+            #
+            # `git_command_env` BUILDS the environment rather than merging over
+            # `os.environ`, because an inherited `GIT_DIR` has to be ABSENT and a
+            # merge can only add keys. Left in place it would point every call
+            # below at unrelated metadata while `cwd` still says `proj`.
+            _git_env = git_command_env()
+
+            # `git` itself is resolved OFF `PATH`. A gateway's `PATH` can lead
+            # with an agent-writable directory (a worktree venv's `bin`,
+            # `~/.local/bin`), so a bare `"git"` lets a planted shim run — and on
+            # THIS path what git reports decides which code is installed and
+            # re-executed, so the shim would not merely lie, it would choose the
+            # payload. `AGENTS.md` already requires this for system tools;
+            # `cli_doctor` already did it for git.
+            #
+            # Resolved ONCE here rather than per call, so every step below runs
+            # the same binary: re-resolving per spawn would leave a window for the
+            # answer to change mid-sequence.
+            _git = platform_compat.trusted_git_bin()
+            if _git is None:
+                logger.warning(
+                    "Auto-update: skipping — no trustworthy `git` outside PATH. "
+                    "Run `kirocrew update` to apply this manually."
+                )
+                if self.dashboard_state:
+                    self.dashboard_state.clear_update_progress()
+                    self.dashboard_state.push_refresh("update_available")
+                return
+
             # Detect current branch
             branch_proc = await asyncio.create_subprocess_exec(
-                "git",
+                _git,
                 "rev-parse",
                 "--abbrev-ref",
                 "HEAD",
                 cwd=proj,
+                env=_git_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -8532,22 +8581,64 @@ class GatewayOrchestrator:
                 logger.error("Auto-update: could not determine current branch")
                 return
             branch = branch_out.strip().decode() if branch_out else ""
-            if not branch or branch == "HEAD":
-                branch = "mainline"
 
-            # Only auto-update on mainline — beta/feature branches need manual update
-            if branch != "mainline":
-                logger.debug("Auto-update: skipping — on branch %s, not mainline", branch)
+            # Only a PRIMARY branch is auto-updated: a feature or beta branch
+            # needs a deliberate `kirocrew update`, and a detached HEAD has no
+            # branch to fast-forward at all.
+            #
+            # This gate read `branch != "mainline"` — inherited verbatim from the
+            # internal repo whose primary line is named that — so on this repo,
+            # whose primary line is `main`, it matched nothing and returned at
+            # `logger.debug`. Every git checkout (the documented `install.sh`
+            # path) therefore never auto-updated, and said so nowhere.
+            #
+            # `is_primary_branch` reads a reviewed allowlist and nothing else, so
+            # no local git ref can steer or veto this decision. See its docstring
+            # — this is also the path a mandatory `min_version` floor drives.
+            if not is_primary_branch(branch):
+                logger.info(
+                    "Auto-update: skipping — %s is not a primary branch",
+                    branch or "detached HEAD",
+                )
+                return
+
+            # A content filter or textconv driver is named BY THE REPOSITORY, so
+            # there is no fixed key to pin and `_git_env` cannot reach it. Refuse
+            # the unattended run rather than execute it; the operator still has
+            # `kirocrew update`, where a human is deciding.
+            exec_config = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: repo_exec_config_reason(proj)
+            )
+            if exec_config:
+                logger.warning(
+                    "Auto-update refused: %s, which git would run during the update",
+                    exec_config,
+                )
+                if self.dashboard_state:
+                    self.dashboard_state.push_refresh("update_available")
+                return
+
+            # The availability check compares HEAD against `@{u}` (the TRACKED
+            # upstream) while this applies `origin/<branch>`. On a fork checkout
+            # whose branch tracks `upstream` and whose `origin` is a stale fork,
+            # those are different refs: the check sees the canonical remote move
+            # ahead and the reset below would discard commits. Only reset when the
+            # branch tracks the remote this actually fetches and pins.
+            if not await asyncio.get_running_loop().run_in_executor(
+                None, lambda: tracks_upstream(proj, branch)
+            ):
+                logger.info(
+                    "Auto-update: skipping — %s does not track origin, and the "
+                    "update check measures against its tracked upstream",
+                    branch,
+                )
+                if self.dashboard_state:
+                    self.dashboard_state.push_refresh("update_available")
                 return
 
             # Source pin, checked before the fetch. This is the most privileged
             # update path in the product — no auth, no click, `git reset --hard`
             # + pip + execv on boot — so a blocked host must not touch its tree.
-            from kiro_crew.platform.update_governance import (
-                resolve_remote_url,
-                update_blocked_reason,
-            )
-
             blocked = await asyncio.get_running_loop().run_in_executor(
                 None, lambda: update_blocked_reason(resolve_remote_url(proj, remote="origin"))
             )
@@ -8561,11 +8652,12 @@ class GatewayOrchestrator:
                 self.dashboard_state.push_update_progress("pulling", "Fetching latest changes…")
 
             fetch = await asyncio.create_subprocess_exec(
-                "git",
+                _git,
                 "fetch",
                 "origin",
                 branch,
                 cwd=proj,
+                env=_git_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -8576,14 +8668,51 @@ class GatewayOrchestrator:
                     self.dashboard_state.clear_update_progress()
                 return
 
+            # Capture the fetched commit as an OID, immediately after the fetch,
+            # and use that OID for the comparison AND the reset below. A ref name
+            # is re-resolved on every command, so `origin/<branch>` could be moved
+            # by a concurrent fetch between the decision and the reset — deciding
+            # against one commit and resetting to another. An OID cannot move.
+            #
+            # The ref is spelled in FULL (`refs/remotes/origin/...`) because the
+            # short form is ambiguous in the attacker's favour: rev-parse's
+            # disambiguation order checks `refs/tags/<name>` BEFORE
+            # `refs/remotes/<name>`, so a tag literally named `origin/main`
+            # resolves instead of the remote-tracking branch — and the update's
+            # own `git fetch` auto-follows tags, so publishing that tag upstream
+            # is enough to create it locally. git prints "refname is ambiguous"
+            # to stderr and still writes the TAG's OID to stdout, which is what
+            # this capture reads, so the short form fails silently here.
+            target_proc = await asyncio.create_subprocess_exec(
+                _git,
+                "rev-parse",
+                "--verify",
+                f"refs/remotes/origin/{branch}^{{commit}}",
+                cwd=proj,
+                env=_git_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            target_out, _ = await asyncio.wait_for(target_proc.communicate(), timeout=10)
+            target = (target_out or b"").strip().decode()
+            if target_proc.returncode != 0 or not target:
+                logger.warning(
+                    "Auto-update: skipping — could not resolve origin/%s to a commit",
+                    branch,
+                )
+                if self.dashboard_state:
+                    self.dashboard_state.clear_update_progress()
+                return
+
             # Check if there are actually new commits
             diff_proc = await asyncio.create_subprocess_exec(
-                "git",
+                _git,
                 "diff",
                 "HEAD",
-                f"origin/{branch}",
+                target,
                 "--quiet",
                 cwd=proj,
+                env=_git_env,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -8594,33 +8723,172 @@ class GatewayOrchestrator:
                     self.dashboard_state.clear_update_progress()
                 return
 
-            # Warn if local tracked-file edits will be discarded
+            # LAST-MOMENT REVALIDATION, after the fetch and immediately before the
+            # only destructive step. Everything checked so far was checked
+            # earlier: the availability verdict came from a separate pass, and
+            # the config probe ran before the fetch. A checkout is a live tree —
+            # a developer can commit, or repo config can be rewritten, in the
+            # window between those checks and this reset. `reset --hard` is not
+            # recoverable from, so the two facts that decide whether it destroys
+            # anything are re-read here rather than trusted from before.
+            #
+            # 1. Local commits. `git status --porcelain` below reports
+            #    working-tree edits, NOT commits, and the `git diff` above is
+            #    satisfied by any difference in either direction — so a checkout
+            #    that is ahead of origin passes both and then loses those commits.
+            # Counted against `target` — the OID the reset will use — not against
+            # `origin/<branch>`. A ref is re-resolved per command, so a concurrent
+            # fetch could advance it, make this read zero against the new tip, and
+            # leave the reset discarding commits relative to the old one.
+            ahead = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: commits_ahead(proj, target)
+            )
+            if ahead != 0:
+                logger.warning(
+                    "Auto-update: skipping — %s is ahead of origin/%s by %s commit(s); "
+                    "a reset would discard them. Run `kirocrew update` to decide.",
+                    branch,
+                    branch,
+                    "an unknown number of" if ahead is None else ahead,
+                )
+                if self.dashboard_state:
+                    self.dashboard_state.clear_update_progress()
+                    self.dashboard_state.push_refresh("update_available")
+                return
+
+            # 2. The work tree, and the repo-named exec drivers, re-read after the
+            #    fetch. The earlier probe is a check-then-use otherwise: config
+            #    rewritten in between would redirect this reset, or hand the
+            #    checkout's own driver to the command that performs it.
+            exec_config_now = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: repo_exec_config_reason(proj)
+            )
+            if exec_config_now:
+                logger.warning("Auto-update refused before reset: %s", exec_config_now)
+                if self.dashboard_state:
+                    self.dashboard_state.clear_update_progress()
+                    self.dashboard_state.push_refresh("update_available")
+                return
+
+            # 3. Uncommitted tracked edits. REFUSE, like the two checks above —
+            #    this one used to log a warning and then reset anyway, which made
+            #    an unattended boot-time update the one code path that could
+            #    silently destroy a developer's uncommitted work. `reset --hard`
+            #    is not recoverable and nothing here has the standing to make
+            #    that trade on the developer's behalf: the count check one screen
+            #    up already refuses for COMMITTED work and defers to `kirocrew
+            #    update`, and uncommitted work is the strictly more fragile case
+            #    (a discarded commit is at least recoverable from the reflog; an
+            #    uncommitted edit is gone). The manual path keeps the destructive
+            #    semantics, because there a human chose them.
+            #
+            #    Untracked files are excluded: `reset --hard` preserves them, so
+            #    task specs and notes are not a reason to refuse.
             status_proc = await asyncio.create_subprocess_exec(
-                "git",
+                _git,
                 "status",
                 "--porcelain",
                 cwd=proj,
+                env=_git_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
             status_out, _ = await asyncio.wait_for(status_proc.communicate(), timeout=10)
-            if status_out and status_out.strip():
-                tracked = [
-                    ln
-                    for ln in status_out.decode(errors="replace").splitlines()
-                    if not ln.startswith("??")
-                ]
-                if tracked:
-                    logger.warning("Auto-update: discarding local tracked-file changes in %s", proj)
+            if status_proc.returncode != 0:
+                # Cannot prove the tree is clean, and the next step is
+                # irreversible — treat an unreadable status as dirty.
+                logger.warning(
+                    "Auto-update: skipping — could not read the work-tree status of %s; "
+                    "a reset could discard uncommitted changes. Run `kirocrew update`.",
+                    proj,
+                )
+                if self.dashboard_state:
+                    self.dashboard_state.clear_update_progress()
+                    self.dashboard_state.push_refresh("update_available")
+                return
+            tracked = [
+                ln
+                for ln in (status_out or b"").decode(errors="replace").splitlines()
+                if ln.strip() and not ln.startswith("??")
+            ]
+            if tracked:
+                logger.warning(
+                    "Auto-update: skipping — %s has %s uncommitted tracked change(s); "
+                    "a reset would discard them. Run `kirocrew update` to decide.",
+                    proj,
+                    len(tracked),
+                )
+                if self.dashboard_state:
+                    self.dashboard_state.clear_update_progress()
+                    self.dashboard_state.push_refresh("update_available")
+                return
 
-            # Hard reset to remote — discards local tracked-file edits,
-            # untracked files (task specs, notes) are preserved.
+            # 4. Untracked files that the TARGET would create. `reset --hard`
+            #    leaves untracked files alone ONLY while they do not collide with
+            #    a path the target adds -- where it does, the local file is
+            #    overwritten. `git status --porcelain` reports such a file as
+            #    `??`, which check 3 deliberately skips, so this is the one
+            #    data-loss case that survives a "clean" tracked tree. Verified:
+            #    upstream adds `newfile.txt`, a local untracked `newfile.txt` is
+            #    replaced by the upstream content.
+            #
+            #    Detected rather than prevented by switching to `merge --ff-only`:
+            #    the reset semantics are deliberate (documented as discarding
+            #    tracked edits) and this path keeps them. A collision is a refusal
+            #    for the same reason as the three above -- it is unrecoverable and
+            #    unattended.
+            added_proc = await asyncio.create_subprocess_exec(
+                _git,
+                "diff",
+                "--name-only",
+                "--diff-filter=A",
+                "-z",
+                "HEAD",
+                target,
+                cwd=proj,
+                env=_git_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            added_out, _ = await asyncio.wait_for(added_proc.communicate(), timeout=10)
+            if added_proc.returncode != 0:
+                logger.warning(
+                    "Auto-update: skipping — could not list the paths %s would add; "
+                    "a reset could overwrite untracked files. Run `kirocrew update`.",
+                    branch,
+                )
+                if self.dashboard_state:
+                    self.dashboard_state.clear_update_progress()
+                    self.dashboard_state.push_refresh("update_available")
+                return
+            collisions = [
+                name
+                for name in (added_out or b"").decode(errors="replace").split("\0")
+                if name and os.path.lexists(os.path.join(proj, name))
+            ]
+            if collisions:
+                logger.warning(
+                    "Auto-update: skipping — %s would add %s path(s) that already "
+                    "exist untracked here (e.g. %s); a reset would overwrite them. "
+                    "Run `kirocrew update` to decide.",
+                    branch,
+                    len(collisions),
+                    collisions[0],
+                )
+                if self.dashboard_state:
+                    self.dashboard_state.clear_update_progress()
+                    self.dashboard_state.push_refresh("update_available")
+                return
+
+            # Hard reset to remote. Reached only with a clean tracked tree and no
+            # untracked collisions, so it overwrites nothing the developer owns.
             reset = await asyncio.create_subprocess_exec(
-                "git",
+                _git,
                 "reset",
                 "--hard",
-                f"origin/{branch}",
+                target,
                 cwd=proj,
+                env=_git_env,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )

@@ -1124,33 +1124,6 @@ def _linger_enabled(user: str) -> bool | None:
     return None
 
 
-# Git for Windows never lives in the system directories the trusted resolver
-# pins Windows lookups to — it installs under Program Files. Fixed literal
-# roots, not ``%ProgramFiles%``: doctor runs with operator privileges, and
-# reading the environment would let a poisoned variable redirect the lookup to
-# an agent-writable directory — the exact hole the pin exists to close.
-_WINDOWS_GIT_DIRS = (
-    r"C:\Program Files\Git\cmd",
-    r"C:\Program Files (x86)\Git\cmd",
-)
-
-
-def _windows_git_bin() -> str | None:
-    """``git.exe`` from the fixed Git for Windows install roots, else ``None``.
-
-    Without this, every supported Windows source install reports "could not
-    check" — :func:`platform_compat.trusted_system_bin` only probes the system
-    directories, where git never is. A non-default-drive install still misses
-    and degrades to "could not check", which is honest: this fallback widens
-    the pin only to paths an unprivileged attacker cannot write.
-    """
-    for directory in _WINDOWS_GIT_DIRS:
-        candidate = os.path.join(directory, "git.exe")
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
-
-
 def _git_line(repo: Path, *args: str) -> str | None:
     """First stdout line of ``git -C repo *args``, ``None`` on any failure.
 
@@ -1159,16 +1132,13 @@ def _git_line(repo: Path, *args: str) -> str | None:
     install has no ``.git``, a fresh clone may lack ``origin/HEAD`` — so every
     error collapses to ``None`` and the caller renders "could not check".
 
-    ``git`` is resolved through :func:`platform_compat.trusted_system_bin`
-    rather than a bare ``PATH`` lookup: doctor runs with operator privileges,
-    and an agent-writable directory leading ``PATH`` could plant a ``git``
-    shim. On Windows a resolver miss falls back to the fixed Git for Windows
-    install roots (:func:`_windows_git_bin`); any remaining miss collapses to
+    ``git`` is resolved through :func:`platform_compat.trusted_git_bin` rather
+    than a bare ``PATH`` lookup: doctor runs with operator privileges, and an
+    agent-writable directory leading ``PATH`` could plant a ``git`` shim. That
+    helper carries the Windows install-root fallback; a miss collapses to
     ``None`` like every other failure here — no spawn at all.
     """
-    git = platform_compat.trusted_system_bin("git")
-    if git is None and platform_compat.IS_WINDOWS:
-        git = _windows_git_bin()
+    git = platform_compat.trusted_git_bin()
     if git is None:
         return None
     try:

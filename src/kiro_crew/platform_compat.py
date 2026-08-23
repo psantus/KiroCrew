@@ -1191,6 +1191,41 @@ def _log_tool_outside_trusted_dirs(name: str, directories: tuple[str, ...]) -> N
     )
 
 
+#: Git for Windows' fixed install roots. ``trusted_system_bin`` only probes the
+#: system directories, and git is never there on Windows, so without this every
+#: Windows source install resolves ``git`` to ``None``. Fixed literal roots, not
+#: ``%ProgramFiles%``: reading the environment would let a poisoned variable
+#: redirect the lookup to an agent-writable directory — the exact hole the pin
+#: exists to close. A non-default-drive install still misses and degrades to
+#: "unavailable", which is honest: the fallback widens the pin only to paths an
+#: unprivileged attacker cannot write.
+_WINDOWS_GIT_DIRS = (
+    r"C:\Program Files\Git\cmd",
+    r"C:\Program Files (x86)\Git\cmd",
+)
+
+
+def trusted_git_bin() -> str | None:
+    """The ``git`` executable resolved off ``PATH``, or ``None`` if untrustworthy.
+
+    :func:`trusted_system_bin` plus the Windows install-root fallback, shared by
+    every caller that spawns git for a privileged or unattended purpose (the
+    doctor's read-only probes, and the update seam — where what git returns
+    decides which code the process installs and re-executes).
+
+    ``None`` means "do not spawn git at all". Callers MUST treat it as a refusal;
+    falling back to a bare ``"git"`` reinstates the hazard.
+    """
+    git = trusted_system_bin("git")
+    if git is None and IS_WINDOWS:
+        for directory in _WINDOWS_GIT_DIRS:
+            candidate = os.path.join(directory, "git.exe")
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return None
+    return git
+
+
 def trusted_system_bin(name: str) -> str | None:
     """Resolve *name* from fixed system directories, ignoring ``PATH``.
 
