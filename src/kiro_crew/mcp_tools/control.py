@@ -169,9 +169,9 @@ def schemas() -> list[dict[str, Any]]:
                 "Stop the auto-nudge loop driving your current session. Call this "
                 "when you determine the loop should halt (e.g. goal complete, "
                 "blocked on user input, or a STOP sentinel file indicates shutdown). "
-                "Removes the loop from the AutoNudgeService so no further nudges "
-                "fire into this session. Safe to call even if no loop is active — "
-                "returns a no-op message."
+                "Legacy loops are removed. For a structured monitor, this compatibility "
+                "alias records a durable user-stop outcome and retains the record for "
+                "inspection. Safe to call even if no loop is active."
             ),
             "inputSchema": {
                 "type": "object",
@@ -330,17 +330,17 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "monitor_start",
             "description": (
-                "Start a monitoring loop on YOUR CURRENT session: every "
+                "Legacy fallback for targets or objectives unsupported by monitor_watch. "
+                "A public GitHub pull-request review-readiness watch must use monitor_watch. "
+                "Start a prompt loop on YOUR CURRENT session: every "
                 "interval_secs the given message is re-injected into this same "
                 "session as your next turn — same context, same tools, same "
                 "conversation. The countdown is deadline-preserving: user "
                 "messages defer a due fire until their turn ends but do NOT "
                 "restart the interval, so checks stay on schedule even in an "
                 "actively-used session. Works from dashboard chat, Slack "
-                "threads, and Discord DMs. Use when the user asks to babysit / "
-                "monitor / keep checking something (a PR, CI run, ticket, "
-                "deployment): put the check instructions and the exit condition "
-                "in the message, then END YOUR TURN — the loop wakes you on the "
+                "threads, and Discord DMs. Put the check instructions and the exit "
+                "condition in the message, then END YOUR TURN — the loop wakes you on the "
                 "interval. When the exit condition is met (or the user says "
                 "stop), call autonudge_stop — reaching max_cycles is a runaway "
                 "backstop, NOT a successful finish. Use monitor_update to "
@@ -970,8 +970,10 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
     return session_directive.encode(
         "monitor_watch",
         payload,
-        "Structured monitor requested for this session. End your turn; inspect the monitor "
-        "to confirm the authoritative consumer armed it.",
+        "Structured monitor requested for this session; application is still pending. "
+        "End your turn so the owning session can apply it. The operator can confirm it in "
+        "the dashboard; the agent can call monitor_inspect only at the start of a later "
+        "turn or in response to a later wake.",
     )
 
 
@@ -1019,6 +1021,7 @@ def _compact_monitor_inspection(result: dict[str, Any]) -> dict[str, Any]:
         "last_wake_fingerprint",
         "wake_in_flight",
         "wake_count",
+        "token_usage_known",
         "agent_turns",
         "input_tokens",
         "output_tokens",

@@ -64,6 +64,7 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
                 "monitor": {
                     "kind": "github_pull_request",
                     "wake_count": 3,
+                    "token_usage_known": False,
                     "wake_instructions": "large prompt omitted from inspect",
                     "last_observation_status": "pending",
                     "last_observation_reason_code": "checks_pending",
@@ -82,6 +83,7 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
     payload = json.loads(result)
     assert payload["monitor"]["kind"] == "github_pull_request"
     assert payload["monitor"]["wake_count"] == 3
+    assert payload["monitor"]["token_usage_known"] is False
     assert payload["monitor"]["last_observation_status"] == "pending"
     assert payload["monitor"]["last_observation_reason_code"] == "checks_pending"
     assert payload["monitor"]["last_observation_summary"] == "Two checks are pending."

@@ -1440,6 +1440,15 @@ review threads, and merge blockers) take precedence over simultaneous pending or
 unknown facts. For an actionable classification its deduplication fingerprint
 contains the known blockers but excludes unrelated pending/unknown check churn;
 the full allowlisted canonical observation remains available for inspection.
+Before any fresh provider probe or persisted `BUSY` redispatch, the controller
+persists a terminal budget outcome when a positive runtime, completed-turn, or
+reported-token limit is already spent; an exhausted monitor therefore performs
+neither another provider request nor another action attempt. A previously
+accepted `DISPATCHED` wake still waits for its completion evidence or its bounded
+evidence deadline instead of being cancelled by this check. Token enforcement
+uses the usage values the provider reports; the public `token_usage_known` field
+states whether every completed turn supplied them, while runtime and completed-
+turn limits remain hard fallbacks.
 
 A new actionable fingerprint atomically records `last_wake_fingerprint` and
 `wake_in_flight=True` before delivery. Concurrent or restarted ticks cannot
@@ -1456,7 +1465,8 @@ times out. A pre-turn delivery failure retires the record as
 target unavailable without charging a turn or immediately retrying the same
 fingerprint. Every adapter returns `DISPATCHED`, `BUSY`, or `UNAVAILABLE`.
 `BUSY` persists a short retry for the existing claim without probing or entering
-the model; `DISPATCHED` persists a bounded completion-evidence deadline; only
+the model, but a spent budget terminates it before redispatch; `DISPATCHED`
+persists a bounded completion-evidence deadline; only
 `UNAVAILABLE` is terminal. Expiry without a raw completion event retains the
 terminal `completion_evidence_unavailable` outcome and clears the claim without
 charging or redispatching it. Cadence changes update the policy used for the next
@@ -1481,8 +1491,10 @@ session or loop identifier and are applied to the consumer's authoritative
 binding after the same dashboard/Slack/Discord authorization and critical SEL
 audit as legacy loops. A structured create or update that is disabled,
 unsupported, refused by authorization, or otherwise not applied records a
-`denied` directive outcome rather than a successful application.
-`monitor_inspect` alone is a direct read: it requires a
+`denied` directive outcome rather than a successful application. A create
+acknowledgement is therefore only pending until the current turn ends; the
+operator may confirm application in the dashboard, while the agent can inspect
+only from a later user/wake turn. `monitor_inspect` alone is a direct read: it requires a
 strict authenticated session key and reports unavailable rather than using
 ancestor fallback. Changing target/objective clears comparison and wake
 baselines and increments the durable configuration generation; a probe result is
@@ -1522,7 +1534,8 @@ fields. Legacy `PATCH
 a structured id through the monitor stop authorizer and its audit-before-mutation
 ordering; the generic service update also fails closed for structured records.
 The public monitor projection used by list, slot, WebSocket, and authenticated
-`monitor_inspect` reads includes the canonical `last_observation` plus the dedicated
+`monitor_inspect` reads includes `token_usage_known`, the canonical
+`last_observation`, plus the dedicated
 `last_observation_status`, `last_observation_reason_code`, and
 `last_observation_summary`; persistence-only and raw provider fields remain excluded.
 The projection reconstructs GitHub facts from fixed root and check-bucket allowlists
