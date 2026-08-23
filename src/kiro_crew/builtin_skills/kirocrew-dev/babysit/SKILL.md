@@ -9,13 +9,24 @@ tags: [skill, kirocrew, monitor, babysit]
 
 ## Overview
 
-Use a structured monitor whenever the target is a public GitHub pull request and
-the objective is review readiness. Kiro Crew probes before invoking the model, so
+Use a structured monitor whenever the target is a supported pull request and the
+objective is review readiness. Kiro Crew probes before invoking the model, so
 unchanged polling does not consume agent turns.
 
-## GitHub pull request: one bounded watch
+## Supported pull request: one bounded watch
 
-Call this once with the canonical pull-request URL:
+Choose the kind from the canonical URL. Do not invent a kind or translate one
+provider's URL into another provider's shape.
+
+| URL | `kind` |
+|---|---|
+| `https://github.com/OWNER/REPO/pull/NUMBER` | `github_pull_request` |
+| `https://gitlab.com/GROUP/REPO/-/merge_requests/NUMBER` | `gitlab_merge_request` |
+| `https://GITLAB_HOST/GROUP/REPO/-/merge_requests/NUMBER` | `gitlab_merge_request` when that exact self-managed host is configured |
+| `https://dev.azure.com/ORG/PROJECT/_git/REPO/pullrequest/NUMBER` | `azure_devops_pull_request` |
+| `https://bitbucket.org/WORKSPACE/REPO/pull-requests/NUMBER` | `bitbucket_pull_request` |
+
+Call once with the selected kind and unchanged canonical URL:
 
 ```text
 monitor_watch({
@@ -44,6 +55,10 @@ the session at most once with a compact, bounded summary. Only then fetch logs,
 comments, or diffs needed to act. The token cap applies only when the provider
 reports usage; `token_usage_known` exposes whether it did. Positive runtime and
 completed-turn caps remain hard fallbacks. Provider errors are also bounded.
+GitLab uses the installed `glab` credentials, Azure DevOps uses `az login` or the
+protected `AZURE_DEVOPS_EXT_PAT`, and Bitbucket may use the protected
+`BITBUCKET_EMAIL` plus `BITBUCKET_API_TOKEN`. A setup or authentication refusal is
+authoritative; do not replace it with a legacy full-turn loop.
 
 Use `monitor_update({...})` without an id to change `interval_secs`, positive
 budgets, or `wake_instructions`. Those edits preserve the comparison baseline;

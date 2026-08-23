@@ -873,6 +873,13 @@ omitting wake instructions and browser/persistence internals. Inspection reports
 unavailable when strict identity is absent; it never falls back to the
 process-ancestor resolver.
 
+`monitor_watch.kind` is the closed set `github_pull_request`,
+`gitlab_merge_request`, `azure_devops_pull_request`, and
+`bitbucket_pull_request`, all with the `review_ready` objective. Its target is a
+canonical provider URL and is parsed against that kind before a directive is
+emitted. A later target-only update is revalidated against the retained kind by
+the authoritative session consumer.
+
 ### The one allowed exception: caller-agnostic process caches
 
 A module-level cache is fine when it is keyed on an **external** signature and is

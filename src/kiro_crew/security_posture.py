@@ -1260,6 +1260,7 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # credentials before they enter canonical monitor state. The controller's
         # later agent-session injection is the registered output boundary.
         "monitoring/github_pull_request.py",
+        "monitoring/pull_request.py",
         # Computer use: the redaction pass runs on third-party desktop content
         # (window titles, accessibility values) on its way INTO the model's
         # context, exactly like the MCP tool-result paths above. `policy.py` owns

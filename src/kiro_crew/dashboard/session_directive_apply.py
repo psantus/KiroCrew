@@ -443,7 +443,9 @@ async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
 
 async def _structured_monitor_update(svc: Any, loop: Any, patch: dict[str, Any]) -> str:
     from kiro_crew.autonudge_authz import authorize_and_update_monitor
+    from kiro_crew.dashboard.handlers.source_providers import ensure_gitlab_hosts_loaded
     from kiro_crew.monitoring.models import MonitorBudgets
+    from kiro_crew.monitoring.targets import normalize_pull_request_target
 
     legacy_only = sorted(set(patch) & {"message", "max_cycles", "active"})
     if legacy_only:
@@ -456,7 +458,15 @@ async def _structured_monitor_update(svc: Any, loop: Any, patch: dict[str, Any])
         raise _DirectiveDenied("No structured monitor on this session to update.")
     structured: dict[str, Any] = {}
     if "target" in patch:
-        structured["target"] = str(patch["target"])
+        try:
+            gitlab_hosts = await ensure_gitlab_hosts_loaded()
+            structured["target"] = normalize_pull_request_target(
+                state.kind,
+                str(patch["target"]),
+                gitlab_hosts=tuple(gitlab_hosts),
+            )
+        except ValueError as exc:
+            raise _DirectiveDenied(str(exc)) from exc
     if "objective" in patch:
         structured["objective"] = str(patch["objective"])
     if "idle_secs" in patch:

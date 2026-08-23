@@ -1424,18 +1424,35 @@ only monitor models at module scope; the pull-request target parser loads when a
 monitor mutation route is actually invoked, not while the disabled gateway
 assembles its HTTP application.
 
-`MonitorController` currently accepts only a public GitHub pull request with the
-`review_ready` objective. The typed provider probe runs off the event loop. The
-controller persists canonical allowlisted facts, fingerprint, dedicated latest
+`MonitorController` accepts `review_ready` pull requests from public GitHub,
+GitLab.com or an exact configured self-managed GitLab host, Azure DevOps Services
+at `dev.azure.com`, and Bitbucket Cloud at `bitbucket.org`. A kind-keyed provider
+registry selects the adapter; kind/target mismatches fail before provider I/O.
+Azure DevOps Server and Bitbucket Data Center are not supported. The typed
+provider probe runs off the event loop behind one shared four-probe concurrency
+gate. Provider CLI resource limits are installed by the synchronous spawn shim
+after exec, so a threaded gateway never runs Python in a fork child. GitLab
+pipeline reads are filtered to the merge request's current head
+revision; pipeline and discussion reads consume at most two 100-item pages, and
+a still-full second page remains explicitly incomplete. Azure optional reviewers
+with no vote do not create a review requirement, while an explicit negative vote
+remains actionable. Bitbucket review readiness considers only participants whose
+role is `REVIEWER`; authors and other participants cannot create a phantom review
+requirement. Async dashboard and MCP mutation paths await the shared, asynchronously
+refreshed GitLab-host snapshot before target normalization; they never read config
+files on the gateway event loop. Azure status/policy labels and Bitbucket build-status
+labels become stable opaque identities before canonicalization, so provider display
+text cannot enter a structured wake. The controller persists canonical allowlisted
+facts, fingerprint, dedicated latest
 classification/reason/summary fields, error counters, decision, and next deadline
-before returning. `last_observation` remains the GitHub fact snapshot; it never
+before returning. `last_observation` remains the provider-neutral pull-request fact snapshot; it never
 contains the typed fingerprint, status, reason, or summary. A provider error updates
 the dedicated latest fields while retaining the last good canonical facts and
 fingerprint. `NO_CHANGE`, `RECORD_ONLY`,
 `RETRY_PROVIDER`, and all terminal decisions dispatch zero agent turns. Retryable
 provider errors use bounded exponential backoff; terminal provider, success,
 blocked, and budget outcomes remain inspectable with stable reason codes.
-Known actionable GitHub facts (failed checks, requested changes, unresolved
+Known actionable facts (failed checks or policies, requested changes, unresolved
 review threads, and merge blockers) take precedence over simultaneous pending or
 unknown facts. For an actionable classification its deduplication fingerprint
 contains the known blockers but excludes unrelated pending/unknown check churn;
@@ -1523,7 +1540,9 @@ The dashboard contract is separate from legacy `/api/autonudge` mutations:
 /api/monitors/{id}`, `POST /api/monitors/{id}/stop`, and the sole explicit
 revival route `POST /api/monitors/{id}/restart`. Reads include terminal records.
 Creation uses the same positive defaults and bounds as MCP; zero is never
-unlimited. Restart rejects an unsupported future monitor version with the stable
+unlimited. The dashboard infers the immutable kind from the canonical target URL;
+the backend repeats strict kind/host/path validation on create and target update.
+Restart rejects an unsupported future monitor version with the stable
 `unsupported_monitor_version` code and does not rewrite its exact retained raw
 payload. The AutoNudge websocket payload adds monitor state only for structured
 records, leaving the legacy websocket shape unchanged. Legacy `/api/autonudge`
@@ -1538,11 +1557,16 @@ The public monitor projection used by list, slot, WebSocket, and authenticated
 `last_observation`, plus the dedicated
 `last_observation_status`, `last_observation_reason_code`, and
 `last_observation_summary`; persistence-only and raw provider fields remain excluded.
-The projection reconstructs GitHub facts from fixed root and check-bucket allowlists
-with a deep copy. Unknown persisted keys are omitted, and an incomplete or malformed
-canonical shape projects as an empty observation; non-string enum fields fail
-closed before membership checks and cannot abort a list, WebSocket, or inspect
-response.
+The projection reconstructs provider-neutral pull-request facts from fixed root
+and check-bucket allowlists with a deep copy. Unknown persisted keys are omitted,
+and an incomplete or malformed canonical shape projects as an empty observation;
+non-string enum fields fail closed before membership checks and cannot abort a
+list, WebSocket, or inspect response.
+Each check bucket is limited to 100 identities, each identity is limited to 200
+characters with a stable digest suffix, and source overflow is retained as
+incomplete evidence rather than a false review-ready result.
+An otherwise valid observation whose kind differs from its owning monitor also
+projects empty and the dashboard treats the record as inert.
 
 The SPA represents this compatibility boundary as one discriminated
 `AutomationRecord`: `legacy_goal_loop` and `structured_monitor` never share an
@@ -1596,8 +1620,14 @@ three-provider-error defaults. The form enforces the backend bounds: cadence
 Each field exposes the same HTML bound and a localized inline error. Updates
 track dirty fields, reconcile untouched values from same-monitor WebSocket
 frames, and send only the dirty fields, so a stale form cannot move a fresh
-deadline or overwrite concurrent configuration. Its detail renders target,
-objective, next probe, wake instructions,
+deadline or overwrite concurrent configuration. The URL field names all four
+source providers, accepts explicitly allowlisted self-managed GitLab ports,
+removes copied-link queries/fragments, canonicalizes the common GitHub `/files`,
+GitLab `/diffs`, and Bitbucket `/diff` tabs before submission, distinguishes empty
+and malformed URLs from provider-changing edits, and maps only the backend's
+`gitlab_host_not_allowed` code to localized `dashboard.gitlab_hosts` setup guidance
+without rendering provider response text.
+Its detail renders target, objective, next probe, wake instructions,
 all budgets, latest classification/decision, probe/wake/turn/token/provider-error
 usage, and terminal reason. Terminal records are retained and read-only; Restart
 is their sole action. The legacy goal-loop form remains reachable behind an

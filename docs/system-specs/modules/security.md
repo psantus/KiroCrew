@@ -958,8 +958,9 @@ exists.
 
 Raw stdout, stderr, response envelopes, URLs, timestamps, cursor/request ids, bodies,
 comments, and logs never cross the adapter boundary into monitor state, exceptions,
-or logging. Canonical state is an explicit small allowlist; check labels are stripped
-of URLs and passed through `security.redact()` before persistence. Provider failures
+or logging. Canonical state is an explicit small allowlist; check labels have control
+and line-separator characters replaced before URLs are stripped and the result passes
+through `security.redact()` before persistence. Provider failures
 are reduced in memory to fixed error kinds and reason codes, including a non-retryable
 setup kind for missing, untrusted, or unexecutable `gh`; raw diagnostic text is then
 discarded. Open-PR review-thread pagination is bounded to ten 100-node pages, and
@@ -972,6 +973,57 @@ The provider adapter's redaction is classified as inbound canonicalization rathe
 than an egress surface. The structured monitor controller is the corresponding
 registered redaction sink: it passes the complete bounded wake envelope through the
 exfiltration-URL and credential scanners before injecting it into an agent session.
+
+**Additional structured source-provider boundaries**
+(`monitoring/gitlab_merge_request.py`, `azure_devops_pull_request.py`, and
+`bitbucket_pull_request.py`): all adapters emit the same exact bounded canonical
+pull-request facts and stable error taxonomy. GitLab accepts `gitlab.com` plus
+only exact operator-configured self-managed hosts and rechecks that allowlist on
+each probe; self-managed calls do not receive the ambient `GITLAB_TOKEN`. GitLab
+and Azure execute only validated absolute `glab`/`az` binaries with minimal
+provider-scoped environments. The shared CLI transport strips ambient SSH and
+language-runtime injection variables (including Python, virtualenv, Conda, and
+Node search paths), replaces inherited `PATH` with the platform's trusted system
+path when one exists, and routes the validated argv through
+`sandboxed_spawn_argv(mode="standard")` from the filesystem root. The sandbox's
+general environment scrub runs first; the transport then restores only credentials
+explicitly scoped to that provider invocation. It drains stdout/stderr concurrently
+into fixed byte ceilings. Crossing a ceiling terminates and reaps the sandboxed
+process tree instead of buffering or orphaning the remainder. GitLab's
+ambient-token decision is the same shared
+host-policy predicate used by the dashboard source panel, so self-managed hosts
+cannot drift onto the gitlab.com-token path. The transport also enforces fixed
+timeouts, disabled Azure extension dynamic installation, a shared four-probe
+concurrency ceiling, and credential-free lifecycle audit records. Azure accepts only
+`dev.azure.com`; its optional `AZURE_DEVOPS_EXT_PAT` is loaded from the protected
+credential file and is denied to agent subprocesses. Bitbucket accepts only
+`bitbucket.org` targets and constructs requests under the fixed
+`api.bitbucket.org/2.0` root; responses are size- and timeout-bounded. Optional
+`BITBUCKET_EMAIL` and `BITBUCKET_API_TOKEN` credentials are used only to build the
+HTTPS Authorization header and are never placed in argv, monitor state, logs, or
+browser payloads. Azure DevOps Server and Bitbucket Data Center URLs fail before
+credentials or network access.
+
+Pod environments scrub the loader's complete credential roster, including the
+Azure DevOps and Bitbucket source-provider credentials, before an isolated gateway
+or arbitrary `pod exec` command can inherit it. The only roster exceptions are
+`KIRO_API_KEY`, which the pod's agent needs for model access, and
+`KIROCREW_OWNER_ID`, which identifies the pod dashboard owner rather than an
+external service identity.
+
+Every provider head revision is either absent or bounded hexadecimal text before
+canonicalization, persistence, or prompt construction. Azure target parsing
+accepts canonical `%20` escapes in project and repository segments while keeping
+path separators, queries, fragments, and noncanonical encodings denied. The
+fixed-argv Azure provider process explicitly receives and exposes only its
+resolved `AZURE_CONFIG_DIR` (defaulting to the gateway user's `~/.azure`) through
+the otherwise-standard sandbox, so the documented `az login` credential store
+works without making that directory visible to agent subprocesses.
+
+Azure status and policy display labels and Bitbucket build-status labels are
+provider-controlled text. The adapters replace them with stable, namespaced SHA-256
+identities before they enter canonical state, fingerprints, persistence, or a wake
+envelope; the display labels themselves never reach an unattended agent prompt.
 
 Sidebar status follows the same read-only boundary. `GET /api/chat/slots` and the WebSocket handshake schedule provider refreshes and opt into cached `ci`/`state` fields only for an exact configured-owner request, or for signed `local-app`/`local-startup` dashboard subjects when no owner is configured. Generic slot serialization omits those fields. `DashboardState` tracks owner-authorized WebSockets separately, sends generic slot updates to all authenticated clients, then overlays credential-backed status only to the owner subset. This prevents a cache populated by an owner request from being replayed to a non-owner or app-token caller. Review-thread cache removal, generation advancement, and stale in-flight detachment still complete after thread ownership validation and before mutation dispatch, so cancellation cannot preserve or repopulate pre-mutation data.
 

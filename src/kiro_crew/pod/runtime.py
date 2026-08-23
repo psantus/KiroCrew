@@ -1035,11 +1035,13 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
     ``MICROSOFT_APP_TENANT_ID`` / ``FEISHU_APP_ID`` / ``FEISHU_APP_SECRET`` ends
     in ``_TOKEN``, so the generic suffix rule that catches every other channel's
     bot credential passes the Azure Bot secret and the Feishu app secret straight
-    through. ``AWS_*`` is kept on purpose (pods run agent turns), and the
-    ``_TOKEN`` scrub deliberately EXCLUDES ``AWS_`` so ``AWS_SESSION_TOKEN`` (temp
-    creds) survives intact — scrubbing it would leave half a credential and break
-    every AWS call. Config-level channel enables are additionally forced off by
-    ``sanitized_seed_config`` (defense-in-depth).
+    through. The loader's complete credential roster is then scrubbed except for
+    ``KIRO_API_KEY`` (the pod agent's model
+    credential) and ``KIROCREW_OWNER_ID`` (dashboard ownership, not a channel or
+    source-provider identity). ``AWS_*`` is kept on purpose (pods run agent turns),
+    and the generic ``_TOKEN`` scrub deliberately excludes ``AWS_`` so
+    ``AWS_SESSION_TOKEN`` survives intact. Config-level channel enables are
+    additionally forced off by ``sanitized_seed_config`` (defense-in-depth).
     """
     env = {
         **os.environ,
@@ -1092,6 +1094,10 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
         or k.startswith("FEISHU_")
         or (k.endswith("_TOKEN") and not k.startswith("AWS_"))
     ]:
+        env.pop(key, None)
+    from kiro_crew.config.loader import _CREDENTIAL_KEYS, CRED_KIRO_API_KEY, CRED_OWNER_ID
+
+    for key in set(_CREDENTIAL_KEYS) - {CRED_KIRO_API_KEY, CRED_OWNER_ID}:
         env.pop(key, None)
     # Cross-plane guard: a gateway-descended caller inherits the LIVE
     # gateway's KIROCREW_BOUND_PORT (dashboard.server._export_bound_port).

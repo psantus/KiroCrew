@@ -3,10 +3,11 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import SessionAutomationPopover from '../components/SessionAutomationPopover'
 import { normalizeAutomationRecord, type StructuredMonitor } from '../monitoring/automation'
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 import { structuredMonitorLoop } from './monitorFixtures'
 
-vi.mock('../api/client', () => ({
+vi.mock('../api/client', async importOriginal => ({
+  ...await importOriginal<typeof import('../api/client')>(),
   api: {
     monitorCreate: vi.fn(),
     monitorUpdate: vi.fn(),
@@ -71,6 +72,133 @@ describe('SessionAutomationPopover', () => {
       max_provider_errors: 3,
       wake_instructions: '',
     }))
+  })
+
+  it.each([
+    ['https://gitlab.com/acme/widgets/-/merge_requests/2', 'gitlab_merge_request'],
+    ['https://dev.azure.com/acme/project/_git/widgets/pullrequest/3', 'azure_devops_pull_request'],
+    ['https://bitbucket.org/acme/widgets/pull-requests/4', 'bitbucket_pull_request'],
+  ])('creates a bounded %s monitor', async (target, kind) => {
+    ;(api.monitorCreate as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, monitor: {} })
+    renderPopover(null)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: target },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    await waitFor(() => expect(api.monitorCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ kind, target }),
+    ))
+  })
+
+  it('canonicalizes a provider subtab before creating the monitor', async () => {
+    ;(api.monitorCreate as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, monitor: {} })
+    renderPopover(null)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://gitlab.com/acme/widgets/-/merge_requests/2/diffs' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    await waitFor(() => expect(api.monitorCreate).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'gitlab_merge_request',
+      target: 'https://gitlab.com/acme/widgets/-/merge_requests/2',
+    })))
+  })
+
+  it('canonicalizes copied pull request links with query strings and fragments', async () => {
+    ;(api.monitorCreate as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, monitor: {} })
+    renderPopover(null)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: {
+        value: 'https://github.com/kirodotdev/KiroCrew/pull/42?notification_referrer_id=1#discussion_r2',
+      },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    await waitFor(() => expect(api.monitorCreate).toHaveBeenCalledWith(expect.objectContaining({
+      target: 'https://github.com/kirodotdev/KiroCrew/pull/42',
+    })))
+  })
+
+  it('names all supported source providers at the target field', () => {
+    renderPopover(null)
+
+    expect(screen.getByText('GitHub, GitLab, Azure DevOps, and Bitbucket are supported.'))
+      .toBeInTheDocument()
+  })
+
+  it('distinguishes an invalid target from a provider-changing edit', async () => {
+    const { rerenderAutomation } = renderPopover(null)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://example.com/not-a-pull-request' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+    expect(await screen.findByText('Enter a supported pull request URL.')).toBeInTheDocument()
+
+    rerenderAutomation(activeMonitor)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://gitlab.com/acme/widgets/-/merge_requests/2' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+    expect(await screen.findByText(
+      'Stop this monitor, then create a new one for the other provider.',
+    ))
+      .toBeInTheDocument()
+  })
+
+  it('keeps the required URL error when an existing target is cleared', async () => {
+    renderPopover(activeMonitor)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: '' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+
+    expect(await screen.findByText('Enter a pull request URL.')).toBeInTheDocument()
+    expect(screen.queryByText(
+      'Stop this monitor, then create a new one for the other provider.',
+    ))
+      .not.toBeInTheDocument()
+  })
+
+  it('explains the GitLab allowlist when the backend rejects a valid custom host', async () => {
+    ;(api.monitorCreate as ReturnType<typeof vi.fn>).mockRejectedValue(new ApiError(
+      400,
+      'Bad Request',
+      JSON.stringify({ code: 'gitlab_host_not_allowed', error: 'target is not allowed' }),
+    ))
+    renderPopover(null)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://git.example:8443/acme/widgets/-/merge_requests/2' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    expect(await screen.findByText(
+      "This GitLab host isn't allowed yet. Add it to dashboard.gitlab_hosts in settings.",
+    )).toBeInTheDocument()
+  })
+
+  it('does not guess an allowlist error from a generic backend rejection', async () => {
+    ;(api.monitorCreate as ReturnType<typeof vi.fn>).mockRejectedValue(new ApiError(
+      400,
+      'Bad Request',
+      JSON.stringify({ code: 'invalid_monitor', error: 'wake instructions are invalid' }),
+    ))
+    renderPopover(null)
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://git.example/acme/widgets/-/merge_requests/2' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    expect(await screen.findByText('The monitor request failed. Try again.')).toBeInTheDocument()
+    expect(screen.queryByText(
+      "This GitLab host isn't allowed yet. Add it to dashboard.gitlab_hosts in settings.",
+    )).not.toBeInTheDocument()
   })
 
   it.each(['', '0', '-1', '1.5', 'NaN'])('rejects %j as an unbounded cadence', async value => {

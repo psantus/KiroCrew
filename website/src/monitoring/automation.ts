@@ -15,6 +15,62 @@ export const STRUCTURED_MONITOR_DEFAULTS = {
   maxProviderErrors: STRUCTURED_MONITOR_LIMITS.maxProviderErrors.defaultValue,
 } as const
 
+export const PULL_REQUEST_MONITOR_KINDS = [
+  'github_pull_request',
+  'gitlab_merge_request',
+  'azure_devops_pull_request',
+  'bitbucket_pull_request',
+] as const
+
+export type PullRequestMonitorKind = typeof PULL_REQUEST_MONITOR_KINDS[number]
+
+export type NormalizedPullRequestMonitorTarget = {
+  kind: PullRequestMonitorKind
+  target: string
+}
+
+const MAX_CHECK_IDENTITIES_PER_BUCKET = 100
+const MAX_CHECK_IDENTITY_CHARS = 200
+
+export function normalizePullRequestMonitorTarget(
+  target: string,
+): NormalizedPullRequestMonitorTarget | null {
+  let url: URL
+  try {
+    url = new URL(target)
+  } catch {
+    return null
+  }
+  if (url.protocol !== 'https:' || url.username || url.password) return null
+  const parts = url.pathname.split('/').filter(Boolean)
+  const canonical = (kind: PullRequestMonitorKind, canonicalParts: string[]) => ({
+    kind,
+    target: `${url.origin}/${canonicalParts.join('/')}`,
+  })
+  const githubParts = parts.at(-1) === 'files' ? parts.slice(0, -1) : parts
+  if (!url.port && ['github.com', 'www.github.com'].includes(url.hostname)
+    && githubParts.length === 4 && githubParts[2] === 'pull'
+    && /^[1-9]\d*$/.test(githubParts[3])) {
+    return canonical('github_pull_request', githubParts)
+  }
+  const gitlabParts = parts.at(-1) === 'diffs' ? parts.slice(0, -1) : parts
+  if (gitlabParts.length >= 5 && gitlabParts.at(-3) === '-'
+    && gitlabParts.at(-2) === 'merge_requests'
+    && /^[1-9]\d*$/.test(gitlabParts.at(-1) ?? '')) {
+    return canonical('gitlab_merge_request', gitlabParts)
+  }
+  if (url.hostname === 'dev.azure.com' && parts.length === 6 && parts[2] === '_git'
+    && !url.port && parts[4] === 'pullrequest' && /^[1-9]\d*$/.test(parts[5])) {
+    return canonical('azure_devops_pull_request', parts)
+  }
+  const bitbucketParts = parts.at(-1) === 'diff' ? parts.slice(0, -1) : parts
+  if (url.hostname === 'bitbucket.org' && !url.port && bitbucketParts.length === 4
+    && bitbucketParts[2] === 'pull-requests' && /^[1-9]\d*$/.test(bitbucketParts[3])) {
+    return canonical('bitbucket_pull_request', bitbucketParts)
+  }
+  return null
+}
+
 export type MonitorStatus =
   | 'arm_pending'
   | 'active'
@@ -56,7 +112,7 @@ export interface StructuredMonitor {
   active: boolean
   actionable: boolean
   version: number
-  monitorKind: 'github_pull_request' | string
+  monitorKind: PullRequestMonitorKind | string
   objective: 'review_ready' | string
   target: string
   cadenceSecs: number
@@ -170,10 +226,13 @@ function hasExactKeys(value: JsonObject, keys: readonly string[]): boolean {
 
 function isStringList(value: unknown): boolean {
   return Array.isArray(value)
-    && value.every(item => typeof item === 'string' && item.length > 0)
+    && value.length <= MAX_CHECK_IDENTITIES_PER_BUCKET
+    && value.every(item => typeof item === 'string'
+      && item.length > 0
+      && item.length <= MAX_CHECK_IDENTITY_CHARS)
 }
 
-function isCanonicalGitHubObservation(value: JsonObject | null): boolean {
+function isCanonicalPullRequestObservation(value: JsonObject | null): boolean {
   if (!value) return false
   if (Object.keys(value).length === 0) return true
   const checks = object(value.checks)
@@ -184,7 +243,7 @@ function isCanonicalGitHubObservation(value: JsonObject | null): boolean {
   ])
     && !!checks
     && hasExactKeys(checks, ['failed', 'passed', 'pending', 'unknown'])
-    && value.kind === 'github_pull_request'
+    && isEnum(value.kind, PULL_REQUEST_MONITOR_KINDS)
     && typeof value.target === 'string'
     && value.target.length > 0
     && typeof value.head_revision === 'string'
@@ -332,7 +391,10 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
     monitor?.last_observation_summary,
     monitor?.stopped_reason,
   ].every(value => typeof value === 'string')
-  const observationValid = isCanonicalGitHubObservation(observation)
+  const observationValid = isCanonicalPullRequestObservation(observation)
+    && (!!observation && (
+      Object.keys(observation).length === 0 || observation.kind === monitor?.kind
+    ))
   const enumsValid = isNullableEnum(monitor?.wake_delivery, [
     'dispatched', 'busy', 'unavailable',
   ]) && isNullableEnum(monitor?.last_completion_disposition, [
@@ -352,7 +414,7 @@ export function normalizeAutomationRecord(raw: unknown): AutomationRecord | null
   const lifecycleValid = typeof loop.active === 'boolean' && active !== (outcome !== null)
   const supported = !!monitor
     && monitor.version === 1
-    && text(monitor.kind) === 'github_pull_request'
+    && isEnum(monitor.kind, PULL_REQUEST_MONITOR_KINDS)
     && text(monitor.objective) === 'review_ready'
     && !!text(monitor.target)
     && !!budgets

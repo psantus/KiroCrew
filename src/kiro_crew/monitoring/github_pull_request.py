@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import subprocess
@@ -14,9 +13,14 @@ from urllib.parse import urlparse
 
 from kiro_crew.github_runner import SetupError, resolve_gh, run_gh
 from kiro_crew.monitoring.models import (
-    MonitorObservation,
-    MonitorObservationStatus,
     ProviderErrorKind,
+)
+from kiro_crew.monitoring.pull_request import (
+    PullRequestCheck,
+    PullRequestFacts,
+    PullRequestProbeResult,
+    build_pull_request_probe_result,
+    provider_error_result,
 )
 from kiro_crew.security import redact
 
@@ -76,12 +80,7 @@ class GitHubPullRequestTarget:
         return f"https://{self.host}/{self.owner}/{self.repo}/pull/{self.number}"
 
 
-@dataclass(frozen=True)
-class GitHubCheck:
-    """One normalized logical status check."""
-
-    identity: str
-    state: str
+GitHubCheck = PullRequestCheck
 
 
 @dataclass(frozen=True)
@@ -99,13 +98,7 @@ class GitHubPullRequestResponse:
     review_threads_complete: bool
 
 
-@dataclass(frozen=True)
-class GitHubPullRequestProbeResult:
-    """Canonical durable facts and their generic monitor classification."""
-
-    response: GitHubPullRequestResponse | None
-    canonical: dict[str, object]
-    observation: MonitorObservation
+GitHubPullRequestProbeResult = PullRequestProbeResult
 
 
 class GitHubPullRequestProvider:
@@ -163,35 +156,21 @@ class GitHubPullRequestProvider:
                 ProviderErrorKind.TRANSIENT,
                 "provider_malformed_response",
             )
-        canonical = _canonical_response(response)
-        previous_head = (
-            previous_observation.get("head_revision")
-            if isinstance(previous_observation, Mapping)
-            else None
-        )
-        head_changed = (
-            response.state == "open"
-            and isinstance(previous_head, str)
-            and bool(previous_head)
-            and bool(response.head_revision)
-            and previous_head != response.head_revision
-        )
-        status, reason_code = _classify_response(response)
-        fingerprint_facts = (
-            _actionable_fingerprint_facts(canonical)
-            if status is MonitorObservationStatus.ACTIONABLE
-            else canonical
-        )
-        fingerprint = _fingerprint(fingerprint_facts)
-        return GitHubPullRequestProbeResult(
-            response=response,
-            canonical=canonical,
-            observation=MonitorObservation(
-                fingerprint,
-                status,
-                reason_code=reason_code,
-                head_changed=head_changed,
+        return build_pull_request_probe_result(
+            PullRequestFacts(
+                kind="github_pull_request",
+                target=response.target.identity,
+                state=response.state,
+                draft=response.draft,
+                head_revision=response.head_revision,
+                mergeability=response.mergeability,
+                review_decision=response.review_decision,
+                checks=response.checks,
+                unresolved_review_threads=response.unresolved_review_threads,
+                review_threads_complete=response.review_threads_complete,
             ),
+            previous_observation=previous_observation,
+            response=response,
         )
 
     def _review_threads(
@@ -458,107 +437,6 @@ def _normalize_mergeability(mergeable: str, merge_state: str) -> str:
     return "mergeable"
 
 
-def _canonical_response(response: GitHubPullRequestResponse) -> dict[str, object]:
-    checks = {
-        state: sorted({check.identity for check in response.checks if check.state == state})
-        for state in ("failed", "passed", "pending", "unknown")
-    }
-    if not response.review_threads_complete:
-        blocking_review = "unknown"
-    elif response.review_decision == "changes_requested":
-        blocking_review = "changes_requested"
-    elif response.unresolved_review_threads:
-        blocking_review = "unresolved_threads"
-    else:
-        blocking_review = "none"
-    return {
-        "blocking_review": blocking_review,
-        "checks": checks,
-        "draft": response.draft,
-        "head_revision": response.head_revision,
-        "kind": "github_pull_request",
-        "mergeability": response.mergeability,
-        "review_decision": response.review_decision,
-        "review_threads_complete": response.review_threads_complete,
-        "state": response.state,
-        "target": response.target.identity,
-        "unresolved_review_threads": response.unresolved_review_threads,
-    }
-
-
-def _fingerprint(canonical: Mapping[str, object]) -> str:
-    encoded = json.dumps(
-        canonical,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _actionable_fingerprint_facts(canonical: Mapping[str, object]) -> dict[str, object]:
-    """Keep known blockers stable while unrelated unsettled facts continue changing."""
-    checks = canonical["checks"]
-    if not isinstance(checks, Mapping):
-        raise ValueError("canonical GitHub checks are malformed")
-    blocking_review = canonical["blocking_review"]
-    mergeability = canonical["mergeability"]
-    return {
-        "blocking_review": (
-            blocking_review
-            if blocking_review in {"changes_requested", "unresolved_threads"}
-            else "none"
-        ),
-        "failed_checks": checks["failed"],
-        "head_revision": canonical["head_revision"],
-        "kind": canonical["kind"],
-        "mergeability": (
-            mergeability if mergeability in {"conflicting", "behind", "blocked"} else "none"
-        ),
-        "state": canonical["state"],
-        "target": canonical["target"],
-    }
-
-
-def _classify_response(
-    response: GitHubPullRequestResponse,
-) -> tuple[MonitorObservationStatus, str]:
-    if response.state == "merged":
-        return MonitorObservationStatus.SUCCESS, "pull_request_merged"
-    if response.state == "closed":
-        return MonitorObservationStatus.BLOCKED, "pull_request_closed"
-    if response.state != "open" or not response.head_revision:
-        return MonitorObservationStatus.PENDING, "pull_request_state_unknown"
-    check_states = {check.state for check in response.checks}
-    if "failed" in check_states:
-        return MonitorObservationStatus.ACTIONABLE, "checks_failed"
-    if response.review_decision == "changes_requested":
-        return MonitorObservationStatus.ACTIONABLE, "changes_requested"
-    if response.unresolved_review_threads:
-        return MonitorObservationStatus.ACTIONABLE, "unresolved_review_threads"
-    if response.mergeability == "conflicting":
-        return MonitorObservationStatus.ACTIONABLE, "merge_conflict"
-    if response.mergeability == "behind":
-        return MonitorObservationStatus.ACTIONABLE, "branch_behind"
-    if response.mergeability == "blocked":
-        return MonitorObservationStatus.ACTIONABLE, "merge_blocked"
-    if response.draft:
-        return MonitorObservationStatus.PENDING, "pull_request_draft"
-    if "pending" in check_states:
-        return MonitorObservationStatus.PENDING, "checks_pending"
-    if "unknown" in check_states:
-        return MonitorObservationStatus.PENDING, "checks_unknown"
-    if not response.review_threads_complete:
-        return MonitorObservationStatus.PENDING, "review_threads_incomplete"
-    if response.review_decision == "unknown":
-        return MonitorObservationStatus.PENDING, "review_state_unknown"
-    if response.review_decision == "review_required":
-        return MonitorObservationStatus.PENDING, "review_required"
-    if response.mergeability == "pending":
-        return MonitorObservationStatus.PENDING, "mergeability_pending"
-    return MonitorObservationStatus.SUCCESS, "review_ready"
-
-
 def _process_failure(
     proc: subprocess.CompletedProcess[str],
 ) -> GitHubPullRequestProbeResult | None:
@@ -609,13 +487,4 @@ def _classify_cli_error(raw: str) -> ProviderErrorKind:
 
 
 def _provider_error(kind: ProviderErrorKind, reason_code: str) -> GitHubPullRequestProbeResult:
-    return GitHubPullRequestProbeResult(
-        response=None,
-        canonical={},
-        observation=MonitorObservation(
-            "",
-            MonitorObservationStatus.PROVIDER_ERROR,
-            provider_error=kind,
-            reason_code=reason_code,
-        ),
-    )
+    return provider_error_result(kind, reason_code)

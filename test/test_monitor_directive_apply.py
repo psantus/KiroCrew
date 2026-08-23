@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -50,9 +50,14 @@ async def test_watch_update_and_stop_are_authoritative_and_owned(tmp_path):
     )
     slot = SimpleNamespace(key="chat-1", _app="")
     audit = MagicMock()
+    load_hosts = AsyncMock(return_value=frozenset())
     with (
         patch("kiro_crew.autonudge.get_instance", return_value=service),
         patch("kiro_crew.autonudge_authz.sel", return_value=audit),
+        patch(
+            "kiro_crew.dashboard.handlers.source_providers.ensure_gitlab_hosts_loaded",
+            load_hosts,
+        ),
     ):
         created = await apply_session_directive(
             state,
@@ -111,6 +116,7 @@ async def test_watch_update_and_stop_are_authoritative_and_owned(tmp_path):
         assert loop.monitor.last_wake_fingerprint == ""
         assert loop.monitor.last_completion_fingerprint == ""
         assert loop.monitor.consecutive_provider_errors == 0
+        load_hosts.assert_awaited_once_with()
         stopped = await apply_session_directive(
             state,
             slot,

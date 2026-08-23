@@ -25,9 +25,9 @@ from typing import Any
 from urllib.parse import urlparse
 
 from kiro_crew import mcp_core, platform_compat, session_directive
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
-from kiro_crew.monitoring.github_pull_request import parse_github_pull_request_target
 from kiro_crew.monitoring.models import (
     DEFAULT_MONITOR_AGENT_TURNS,
     DEFAULT_MONITOR_CADENCE_SECS,
@@ -42,7 +42,9 @@ from kiro_crew.monitoring.models import (
     MAX_MONITOR_TOKENS,
     MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
     MIN_MONITOR_CADENCE_SECS,
+    PULL_REQUEST_MONITOR_KINDS,
 )
+from kiro_crew.monitoring.targets import normalize_pull_request_target
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.validation import (
@@ -264,15 +266,15 @@ def schemas() -> list[dict[str, Any]]:
         {
             "name": "monitor_watch",
             "description": (
-                "Watch a GitHub pull request with cheap provider probes. The owning session "
+                "Watch a supported pull request with cheap provider probes. The owning session "
                 "is woken only when a new revision needs action; unchanged, pending, retry, "
                 "and terminal probes use no agent turn. One structured monitor per session."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["github_pull_request"]},
-                    "target": {"type": "string", "description": "Public GitHub PR URL"},
+                    "kind": {"type": "string", "enum": sorted(PULL_REQUEST_MONITOR_KINDS)},
+                    "target": {"type": "string", "description": "Canonical provider PR URL"},
                     "objective": {"type": "string", "enum": ["review_ready"]},
                     "interval_secs": {
                         "type": "integer",
@@ -331,7 +333,7 @@ def schemas() -> list[dict[str, Any]]:
             "name": "monitor_start",
             "description": (
                 "Legacy fallback for targets or objectives unsupported by monitor_watch. "
-                "A public GitHub pull-request review-readiness watch must use monitor_watch. "
+                "A supported pull-request review-readiness watch must use monitor_watch. "
                 "Start a prompt loop on YOUR CURRENT session: every "
                 "interval_secs the given message is re-injected into this same "
                 "session as your next turn — same context, same tools, same "
@@ -953,7 +955,11 @@ def monitor_watch(name: str, args: dict[str, Any]) -> str:
             "monitor_watch only works from within a dashboard, Slack, or "
             f"Discord session (current session_key={sk!r})."
         )
-    target = parse_github_pull_request_target(args["target"]).url
+    target = normalize_pull_request_target(
+        args["kind"],
+        args["target"],
+        gitlab_hosts=KiroCrewConfig.load().dashboard.gitlab_hosts,
+    )
     payload = {
         "kind": args["kind"],
         "target": target,
@@ -1110,7 +1116,8 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
     if args.get("max_runtime_secs") is not None:
         patch["max_runtime_secs"] = int(args["max_runtime_secs"])
     if args.get("target") is not None:
-        patch["target"] = parse_github_pull_request_target(str(args["target"])).url
+        # The authoritative applier validates the target against the retained kind.
+        patch["target"] = str(args["target"])
     if args.get("objective") is not None:
         patch["objective"] = str(args["objective"])
     for field in ("max_agent_turns", "max_tokens", "max_provider_errors"):

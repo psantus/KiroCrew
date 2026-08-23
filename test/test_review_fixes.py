@@ -469,6 +469,9 @@ class TestLoadCredentialsEnvPropagation:
             "FEISHU_APP_ID",
             "FEISHU_APP_SECRET",
             "JIRA_API_TOKEN",
+            "AZURE_DEVOPS_EXT_PAT",
+            "BITBUCKET_EMAIL",
+            "BITBUCKET_API_TOKEN",
             "KIRO_API_KEY",
         )
         assert set(fixture_keys) == set(_CREDENTIAL_KEYS)

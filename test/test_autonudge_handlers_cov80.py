@@ -175,6 +175,58 @@ async def test_monitor_create_uses_bounded_defaults(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
+async def test_monitor_create_infers_the_provider_kind_from_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    load_hosts = AsyncMock(return_value=frozenset())
+    monkeypatch.setattr(h, "ensure_gitlab_hosts_loaded", load_hosts, raising=False)
+    authorize = AsyncMock(return_value=(_monitor_loop("new-mon"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+    request = _mk(
+        "POST",
+        "/api/monitors",
+        body={
+            "slot_key": "chat-1-111",
+            "target": "https://gitlab.com/acme/widgets/-/merge_requests/8",
+        },
+    )
+
+    response = await h.api_monitor_create(request)
+
+    assert response.status == 200
+    load_hosts.assert_awaited_once_with()
+    assert authorize.await_args.kwargs["monitor"].kind == "gitlab_merge_request"
+
+
+@pytest.mark.asyncio
+async def test_monitor_create_names_a_disallowed_gitlab_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    monkeypatch.setattr(
+        h,
+        "ensure_gitlab_hosts_loaded",
+        AsyncMock(return_value=frozenset()),
+        raising=False,
+    )
+    request = _mk(
+        "POST",
+        "/api/monitors",
+        body={
+            "slot_key": "chat-1-111",
+            "kind": "gitlab_merge_request",
+            "target": "https://git.example/acme/widgets/-/merge_requests/8",
+        },
+    )
+
+    response = await h.api_monitor_create(request)
+
+    assert response.status == 400
+    assert _body(response)["code"] == "gitlab_host_not_allowed"
+
+
+@pytest.mark.asyncio
 async def test_monitor_create_rejects_unlimited_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     _svc(monkeypatch, _FakeSvc())
     request = _mk(
