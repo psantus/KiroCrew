@@ -11812,7 +11812,19 @@
         "scope_session": "会话",
         "shadowed_by": "已被 {{scope}} 覆盖",
         "overrides": "覆盖 {{scope}}",
-        "workspace_named": "工作区 {{name}}"
+        "workspace_named": "工作区 {{name}}",
+        "usage_hint": "在消息、cron 任务或 Crew 提示词中使用 {{token}} 引用变量。",
+        "remove_variable_confirm": "确认移除 {{name}}",
+        "bulk_edit": "批量编辑",
+        "bulk_label": "每行一个 NAME=value",
+        "bulk_apply": "应用",
+        "bulk_cancel": "取消",
+        "bulk_replaces_scope": "应用将替换此作用域：文本中缺失的名称会被移除。",
+        "from_file_note": "此工作区位于 {{dir}} 的文件中也有定义。要修改请编辑该文件。",
+        "overridden_by_panel": "已被上方覆盖",
+        "scope_workspace_file": "工作区文件",
+        "file_blocked_not_lowercase": "无变量文件：工作区名称必须为小写。",
+        "file_blocked_unusable": "无变量文件：该名称无法用作文件名。"
       }
     },
     "settingsPage": {
@@ -12215,7 +12227,7 @@
       "secrets": {
         "label": "Secrets",
         "description": "安全存储 API 密钥和凭据"
-    },
+      },
       "variables": {
         "label": "环境变量",
         "description": "在代理消息中展开的可复用值"

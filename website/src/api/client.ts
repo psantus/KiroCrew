@@ -1668,6 +1668,24 @@ export interface VariablesView {
    * by Crew" when nothing shadows it there.
    */
   active_workspace?: string
+  /**
+   * Pairs a workspace's dotenv file supplies, keyed by workspace name.
+   *
+   * READ-ONLY: this endpoint does not write those files. Reported so the panel can
+   * show them — a file-defined key that a panel key shadows would otherwise look
+   * like the panel edit had no effect, and a value the operator cannot see is a
+   * value they cannot debug.
+   */
+  workspace_files?: Record<string, Record<string, string>>
+  /** Directory holding those files, so the panel can name where to edit them. */
+  workspace_file_dir?: string
+  /**
+   * Why a workspace can have no dotenv file, keyed by workspace name. Absent from
+   * the map means it can. Reported so the panel can SAY it — a workspace silently
+   * showing no file rows, with the reason only in a gateway log, is the invisible
+   * failure this feature avoids everywhere else.
+   */
+  workspace_file_blocked?: Record<string, string>
 }
 
 /**
@@ -1698,6 +1716,25 @@ export interface VariablesWrite {
    */
   set?: Record<string, string>
   delete?: string[]
+  /**
+   * A whole scope as dotenv text, applied server-side as a per-key diff: every pair
+   * in the text is set, and every stored key ABSENT from it is deleted.
+   *
+   * Mutually exclusive with `set`/`delete` — they describe the scope two different
+   * ways, so applying both would make the result depend on which ran last. The text
+   * is parsed by the backend rather than here, so one parser stays authoritative
+   * over what a stored value may contain.
+   */
+  bulk?: string
+  /**
+   * The scope's pairs as the bulk editor saw them when it opened. Required with
+   * `bulk`, and compared server-side INSIDE the locked store mutation — values
+   * included, not just key presence. A bulk apply deletes every name absent from the
+   * text and overwrites every name in it, so a key or a value another writer changed
+   * in the meantime would be lost to text this operator never saw. Any drift is
+   * refused with 409 rather than merged.
+   */
+  base?: Record<string, string>
 }
 
 export interface WebhooksView {

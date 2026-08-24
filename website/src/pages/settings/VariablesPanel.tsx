@@ -1,11 +1,12 @@
 import React, { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Trash2 } from 'lucide-react'
+import { List, Trash2 } from 'lucide-react'
 
 import { SettingsCard, SettingsSection } from '../../components/settings'
 import { Btn, IconButton, Input } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { api, ApiError, type VariablesView, type VariablesWrite } from '../../api/client'
+import { useArmedDelete } from '../../hooks/useArmedDelete'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { i18nT } from '../../i18n/t'
 
@@ -70,11 +71,12 @@ type Scope = 'global' | 'workspace' | 'crew' | 'session'
 
 /** Broad → narrow, matching `loader.resolve_variables`' merge order. A LOWER rank is
  *  broader, so a row is shadowed exactly when its own rank is below the winner's. */
-const RANK: Record<string, number> = { global: 0, workspace: 1, crew: 2, session: 3 }
+const RANK: Record<string, number> = { global: 0, workspace_file: 1, workspace: 2, crew: 3, session: 4 }
 
 function scopeLabel(scope: string): string {
   switch (scope) {
     case 'global': return i18nT('pages.settings.variablesPanel.scope_global')
+    case 'workspace_file': return i18nT('pages.settings.variablesPanel.scope_workspace_file')
     case 'workspace': return i18nT('pages.settings.variablesPanel.scope_workspace')
     case 'crew': return i18nT('pages.settings.variablesPanel.scope_crew')
     case 'session': return i18nT('pages.settings.variablesPanel.scope_session')
@@ -111,6 +113,84 @@ function fetchVariables(): Promise<PanelData> {
   }
 }
 
+/**
+ * Render pairs as dotenv text for the bulk editor.
+ *
+ * Mirrors `variables.render_dotenv`, and only the RENDER half is duplicated here.
+ * Parsing stays server-side and authoritative, because that is the half that decides
+ * what may be stored — a client-side parser would be a second opinion on a security
+ * rule. Getting this render wrong costs a confusing textarea, not a bad value.
+ *
+ * Quoted only when a value would not survive the round trip bare. Three cases, and
+ * the third is the one that is easy to miss: empty; whitespace at an end that a
+ * re-parse would trim; and a value that is ALREADY a matching quote pair, which
+ * emitted bare would come back with the operator's own quotes stripped — silent
+ * shortening on a save path with no undo. Wrapping it again round-trips, because the
+ * parser removes only the OUTERMOST pair.
+ *
+ * Kept in step with `variables._needs_quoting`, which is the authority.
+ */
+export function renderDotenv(pairs: Record<string, string>): string {
+  const needsQuoting = (v: string) =>
+    v === '' || v !== v.trim() || (v.length >= 2 && v[0] === v[v.length - 1] && (v[0] === '"' || v[0] === "'"))
+  return Object.keys(pairs).sort()
+    .map(name => {
+      const value = pairs[name]
+      return needsQuoting(value) ? `${name}="${value}"` : `${name}=${value}`
+    })
+    .join('\n')
+}
+
+/**
+ * A workspace's dotenv-file pairs, read-only.
+ *
+ * This endpoint does not write those files, so there are no edit controls — showing
+ * them anyway is what stops a shadowed file key from reading as "my panel edit did
+ * nothing". The panel scope wins per key, which the row states rather than implies.
+ */
+function WorkspaceFileRows({
+  pairs, panelPairs, dir, blocked,
+}: {
+  pairs: Record<string, string>
+  /** The same workspace's panel pairs, so a row can say it is being overridden. */
+  panelPairs: Record<string, string>
+  dir: string
+  /** Reason code when this workspace can have no file at all, else ''. */
+  blocked: string
+}) {
+  if (blocked) {
+    return (
+      <p className="text-[12px] text-muted">
+        {blocked === 'name_not_lowercase'
+          ? i18nT('pages.settings.variablesPanel.file_blocked_not_lowercase')
+          : i18nT('pages.settings.variablesPanel.file_blocked_unusable')}
+      </p>
+    )
+  }
+  const names = Object.keys(pairs).sort()
+  if (names.length === 0) return null
+  return (
+    <div className="flex flex-col gap-1">
+      <p className="text-[12px] text-muted">
+        {i18nT('pages.settings.variablesPanel.from_file_note', { dir })}
+      </p>
+      <ul className="flex flex-col gap-1 list-none p-0 m-0">
+        {names.map(name => (
+          <li key={name} className="flex flex-wrap items-baseline gap-x-2 text-[12px]">
+            <span className="font-mono text-text break-all">{name}</span>
+            <span className="font-mono text-muted break-all">{pairs[name]}</span>
+            {name in panelPairs && (
+              <span className="text-muted">
+                {i18nT('pages.settings.variablesPanel.overridden_by_panel')}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 /* ── One scope's editable table ── */
 
 interface TableProps {
@@ -131,7 +211,7 @@ interface TableProps {
    * intact to correct.
    */
   onSave: (
-    change: { set?: Record<string, string>; delete?: string[] },
+    change: { set?: Record<string, string>; delete?: string[]; bulk?: string; base?: Record<string, string> },
     onLanded?: () => void,
   ) => void
   busy: boolean
@@ -155,6 +235,55 @@ function VariableTable({
   // Value being typed, keyed by name. A row commits on blur or Enter, so a
   // half-typed value is never written and the input never fights the query.
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  /**
+   * Arm→confirm→decay via the repo's shared hook rather than a local state machine.
+   * It already owns the parts that are easy to get subtly wrong: arming one row
+   * disarms any other, `confirm` is a no-op for a row that is not CURRENTLY armed (so
+   * a click landing after the decay window cannot delete), and in-flight rows are
+   * tracked as a set so two deletes cannot clear each other's pending state.
+   */
+  const {
+    armedId: armedDelete,
+    arm: armDelete,
+    confirm: confirmDelete,
+  } = useArmedDelete(async (name: string) => {
+    setError(null)
+    // Tied to SUCCESS, exactly as the row-save path below is and for the same reason:
+    // clearing first meant a refused delete threw away what the user had typed and
+    // put the stored value back in the input, with no undo. A delete that fails
+    // leaves the row exactly as the user left it.
+    onSave({ delete: [name] }, () =>
+      setDrafts(d => {
+        const copy = { ...d }
+        delete copy[name]
+        return copy
+      }),
+    )
+  })
+  /** Bulk editor: a whole scope as dotenv text, the way Postman's does it. */
+  const [bulkOpen, setBulkOpen] = useState(false)
+  const [bulkText, setBulkText] = useState('')
+  /** The scope's pairs when the editor opened, sent as the write's baseline. */
+  const [bulkBase, setBulkBase] = useState<Record<string, string>>({})
+
+  /**
+   * Send the text as-is and let the backend parse it.
+   *
+   * No client-side pre-validation, deliberately: `nameError`/`valueError` mirror the
+   * backend for the single-pair form because a round trip per keystroke is the whole
+   * cost of a typo there. A bulk paste is one round trip either way, and the backend
+   * reports the LINE NUMBER, which a mirrored parser here would have to reproduce
+   * exactly to be useful and would silently drift from when it did not.
+   */
+  const applyBulk = () => {
+    setError(null)
+    // `bulkBase` is the scope as it was when the editor OPENED, not as it is now.
+    // The server compares it — values included — inside its locked mutation and
+    // refuses on any drift: a bulk apply deletes everything absent from the text and
+    // overwrites everything in it, so a key OR a value another writer changed in the
+    // meantime would be lost to text this operator never saw.
+    onSave({ bulk: bulkText, base: bulkBase }, () => setBulkOpen(false))
+  }
 
   const names = Object.keys(pairs).sort()
 
@@ -191,16 +320,13 @@ function VariableTable({
   const commitUnlessRemoving = (name: string, next: EventTarget | null) => {
     const target = next as HTMLElement | null
     if (target?.dataset?.removeFor === name) {
-      setDrafts(d => { const copy = { ...d }; delete copy[name]; return copy })
+      // Skip the commit — the click is a delete, and firing a `set` beside it put two
+      // writes in flight for one key. The draft is KEPT: that click only ARMS, so a
+      // confirm that never comes (or times out) would otherwise have silently thrown
+      // away what the user typed. `remove` clears it on the confirming branch.
       return
     }
     commit(name)
-  }
-
-  const remove = (name: string) => {
-    setDrafts(d => { const copy = { ...d }; delete copy[name]; return copy })
-    setError(null)
-    onSave({ delete: [name] })
   }
 
   const add = () => {
@@ -235,10 +361,13 @@ function VariableTable({
                   <span className="font-mono text-[12px] text-text break-all">{name}</span>
                   <IconButton
                     variant="danger"
-                    aria-label={i18nT('pages.settings.variablesPanel.remove_variable', { name })}
+                    aria-label={armedDelete === name
+                      ? i18nT('pages.settings.variablesPanel.remove_variable_confirm', { name })
+                      : i18nT('pages.settings.variablesPanel.remove_variable', { name })}
                     data-remove-for={name}
+                    className={armedDelete === name ? '!bg-[var(--warn)] !text-[var(--warn-fg)]' : undefined}
                     disabled={busy}
-                    onClick={() => remove(name)}
+                    onClick={() => { if (armedDelete === name) void confirmDelete(name); else armDelete(name) }}
                   >
                     <Trash2 size={14} />
                   </IconButton>
@@ -317,10 +446,13 @@ function VariableTable({
                   <td className="py-1.5">
                     <IconButton
                       variant="danger"
-                      aria-label={i18nT('pages.settings.variablesPanel.remove_variable', { name })}
-                    data-remove-for={name}
+                      aria-label={armedDelete === name
+                        ? i18nT('pages.settings.variablesPanel.remove_variable_confirm', { name })
+                        : i18nT('pages.settings.variablesPanel.remove_variable', { name })}
+                      data-remove-for={name}
+                      className={armedDelete === name ? '!bg-[var(--warn)] !text-[var(--warn-fg)]' : undefined}
                       disabled={busy}
-                      onClick={() => remove(name)}
+                      onClick={() => { if (armedDelete === name) void confirmDelete(name); else armDelete(name) }}
                     >
                       <Trash2 size={14} />
                     </IconButton>
@@ -332,6 +464,50 @@ function VariableTable({
         </table>
       )}
 
+      {bulkOpen ? (
+        <div className="flex flex-col gap-2 pt-1">
+          {/* The control is NESTED in its label as well as carrying `htmlFor`/`id`.
+              Both halves are needed: `jsx-a11y/label-has-for` requires nesting AND an
+              id, and `control-has-associated-label` does not follow the id pair on a
+              generated id. Nesting also survives an id collision, which a
+              `useId`-prefixed field cannot rule out across two mounted panels. */}
+          {/* Above the textarea and at body weight, not muted beside Apply. This is
+              the ONLY statement that applying deletes by omission, it has no undo, and
+              a user who trims a line while editing loses that key silently — copy that
+              decides whether data survives is not an aside. */}
+          <p className="text-[13px] text-text">
+            {i18nT('pages.settings.variablesPanel.bulk_replaces_scope')}
+          </p>
+          <label htmlFor={`${uid}-bulk`} className="flex flex-col gap-2">
+            <span className="text-[12px] font-semibold text-text">
+              {i18nT('pages.settings.variablesPanel.bulk_label')}
+            </span>
+          <textarea
+            id={`${uid}-bulk`}
+            // Same string as the visible label above, so the accessible name is
+            // unchanged — `control-has-associated-label` does not follow either the
+            // `htmlFor`/`id` pair or the nesting, and a textarea with no name is the
+            // one control here a screen-reader user cannot identify.
+            aria-label={i18nT('pages.settings.variablesPanel.bulk_label')}
+            value={bulkText}
+            disabled={busy}
+            aria-describedby={noteId}
+            spellCheck={false}
+            rows={Math.min(Math.max(names.length + 2, 4), 16)}
+            onChange={e => setBulkText(e.target.value)}
+            className="font-mono text-[12px] w-full rounded border border-border bg-surface p-2 text-text"
+          />
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <Btn type="button" primary disabled={busy} onClick={applyBulk}>
+              {i18nT('pages.settings.variablesPanel.bulk_apply')}
+            </Btn>
+            <Btn type="button" disabled={busy} onClick={() => setBulkOpen(false)}>
+              {i18nT('pages.settings.variablesPanel.bulk_cancel')}
+            </Btn>
+          </div>
+        </div>
+      ) : (
       <div className="flex flex-col md:flex-row md:flex-wrap md:items-end gap-2 pt-1">
         <div className="flex flex-col gap-1">
           <label htmlFor={`${uid}-new-name`} className="text-[12px] font-semibold text-text">
@@ -364,7 +540,15 @@ function VariableTable({
         <Btn type="button" disabled={busy} onClick={add}>
           {i18nT('pages.settings.variablesPanel.add')}
         </Btn>
+        <Btn
+          type="button"
+          disabled={busy}
+          onClick={() => { setBulkText(renderDotenv(pairs)); setBulkBase({ ...pairs }); setError(null); setBulkOpen(true) }}
+        >
+          <List size={13} className="lucide-inline" /> {i18nT('pages.settings.variablesPanel.bulk_edit')}
+        </Btn>
       </div>
+      )}
 
       {/* `role="alert"` so a rejection reaches a screen-reader user the moment it
           appears — the field they just left is where the fix goes. */}
@@ -441,6 +625,11 @@ export function VariablesPanel() {
       <SettingsSection title={i18nT('pages.settings.variablesPanel.global_environment_variables')}>
         <SettingsCard>
           <p id={noteId} className="text-[12px] text-muted">
+            {/* The literal braces are passed as a value rather than written into the
+                catalog: `{{...}}` is i18next's own interpolation syntax, so a catalog
+                carrying it would be parsed as a placeholder and render empty — and a
+                translator could not see why. */}
+            {i18nT('pages.settings.variablesPanel.usage_hint', { token: '{{name}}' })}{' '}
             {i18nT('pages.settings.variablesPanel.plain_text_note')}
           </p>
           {data.unavailable && !q.isLoading && (
@@ -491,6 +680,12 @@ export function VariablesPanel() {
                       busy={busy}
                       noteId={noteId}
                       onSave={(change, onLanded) => saveMut.mutate({ scope: 'workspace', workspace: ws, ...change }, { onSuccess: onLanded })}
+                    />
+                    <WorkspaceFileRows
+                      pairs={data.workspace_files?.[ws] ?? {}}
+                      panelPairs={data.workspaces[ws]}
+                      dir={data.workspace_file_dir ?? ''}
+                      blocked={data.workspace_file_blocked?.[ws] ?? ''}
                     />
                   </div>
                 )

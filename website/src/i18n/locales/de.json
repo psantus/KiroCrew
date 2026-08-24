@@ -11941,7 +11941,19 @@
         "scope_session": "Sitzung",
         "shadowed_by": "Wird von {{scope}} überschrieben",
         "overrides": "Überschreibt {{scope}}",
-        "workspace_named": "Workspace {{name}}"
+        "workspace_named": "Workspace {{name}}",
+        "usage_hint": "Verwende eine Variable als {{token}} in einer Nachricht, einem Cron-Job oder dem Prompt einer Crew.",
+        "remove_variable_confirm": "Entfernen von {{name}} bestätigen",
+        "bulk_edit": "Sammelbearbeitung",
+        "bulk_label": "Ein NAME=Wert pro Zeile",
+        "bulk_apply": "Anwenden",
+        "bulk_cancel": "Abbrechen",
+        "bulk_replaces_scope": "Das Anwenden ersetzt diesen Bereich: Ein Name, der im Text fehlt, wird entfernt.",
+        "from_file_note": "Auch in der Datei dieses Workspace unter {{dir}} definiert. Bearbeite diese Datei, um sie zu ändern.",
+        "overridden_by_panel": "oben überschrieben",
+        "scope_workspace_file": "Workspace-Datei",
+        "file_blocked_not_lowercase": "Keine Variablendatei: Der Workspace-Name muss kleingeschrieben sein.",
+        "file_blocked_unusable": "Keine Variablendatei: Der Workspace-Name taugt nicht als Dateiname."
       }
     },
     "settingsPage": {
@@ -12352,7 +12364,7 @@
       "secrets": {
         "label": "Secrets",
         "description": "API-Schlüssel und Anmeldedaten sicher speichern"
-    },
+      },
       "variables": {
         "label": "Umgebungsvariablen",
         "description": "Wiederverwendbare Werte, die in Agentennachrichten eingesetzt werden"

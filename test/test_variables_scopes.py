@@ -286,6 +286,50 @@ class TestConfigJsonCarriesNoVariables:
         assert cfg.workspaces["ops"].variables == {"w": "2"}
         assert cfg.agents["crew1"].variables == {"c": "3"}
 
+    def test_a_variables_key_in_config_json_is_never_parsed_back(self, tmp_path, monkeypatch):
+        """The other half of the boundary, and the one nothing else pins.
+
+        ``to_dict`` not EMITTING the key says nothing about ``load`` not READING one.
+        A hand-edited (or pre-move) ``config.json`` still carrying ``variables`` must
+        resolve nothing from it, or the fenced store stops being the only source and
+        an agent that can write ``config.json`` regains the ability to choose what
+        gets substituted into its own next prompt -- the exact hazard the move exists
+        to close.
+
+        Design review asked for this as a ratchet on the in-memory fields: they stay
+        on the dataclasses because the cascade reads them at runtime, which is a
+        standing invitation for a later contributor to "fix" the missing parse. This
+        test is what makes that a red build instead of a silent regression.
+        """
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(
+            json.dumps(
+                {
+                    "variables": {"fromConfig": "global"},
+                    "workspaces": {"ops": {"dir": "w-ops", "variables": {"fromConfig": "ws"}}},
+                    "agents": {
+                        "crew1": {
+                            "kiro_agent": "kirocrew",
+                            "variables": {"fromConfig": "crew"},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(loader_mod, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(loader_mod, "config_local_path", lambda: tmp_path / "local.json")
+        loader_mod._invalidate_config_cache()
+
+        cfg = KiroCrewConfig.load()
+
+        assert cfg.variables == {}, "a config.json global variables key was parsed"
+        assert cfg.workspaces["ops"].variables == {}, "a workspace variables key was parsed"
+        assert cfg.agents["crew1"].variables == {}, "a crew variables key was parsed"
+        # Not an everything-is-empty pass: the sibling keys on the same objects loaded.
+        assert cfg.workspaces["ops"].dir == "w-ops"
+        assert cfg.agents["crew1"].kiro_agent == "kirocrew"
+
     def test_non_variables_fields_at_those_scopes_still_serialize(self):
         """The drop is surgical: a sibling key at the same nesting level survives,
         so this is not just an empty-dict assertion passing for the wrong reason."""

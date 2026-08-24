@@ -11942,7 +11942,19 @@
         "scope_session": "সেশন",
         "shadowed_by": "{{scope}} দিয়ে প্রতিস্থাপিত",
         "overrides": "{{scope}} প্রতিস্থাপন করে",
-        "workspace_named": "ওয়ার্কস্পেস {{name}}"
+        "workspace_named": "ওয়ার্কস্পেস {{name}}",
+        "usage_hint": "একটি মেসেজ, ক্রন জব বা ক্রুর প্রম্পটে ভেরিয়েবলটি {{token}} হিসেবে ব্যবহার করো।",
+        "remove_variable_confirm": "{{name}} মুছে ফেলা নিশ্চিত করো",
+        "bulk_edit": "বাল্ক এডিট",
+        "bulk_label": "প্রতি লাইনে একটি NAME=value",
+        "bulk_apply": "প্রয়োগ করো",
+        "bulk_cancel": "বাতিল",
+        "bulk_replaces_scope": "প্রয়োগ করলে এই স্কোপ প্রতিস্থাপিত হবে: টেক্সটে না থাকা নাম মুছে যাবে।",
+        "from_file_note": "এই ওয়ার্কস্পেসের ফাইলেও ({{dir}}) সংজ্ঞায়িত। পরিবর্তন করতে ওই ফাইল সম্পাদনা করো।",
+        "overridden_by_panel": "উপরে অগ্রাহ্য করা হয়েছে",
+        "scope_workspace_file": "ওয়ার্কস্পেস ফাইল",
+        "file_blocked_not_lowercase": "ভেরিয়েবল ফাইল নেই: ওয়ার্কস্পেসের নাম লোয়ারকেস হতে হবে।",
+        "file_blocked_unusable": "ভেরিয়েবল ফাইল নেই: এই নাম ফাইলনাম হতে পারে না।"
       }
     },
     "settingsPage": {
@@ -12353,7 +12365,7 @@
       "secrets": {
         "label": "Secrets",
         "description": "API কী এবং শংসাপত্রগুলি নিরাপদে সংরক্ষণ করুন"
-    },
+      },
       "variables": {
         "label": "এনভায়রনমেন্ট ভ্যারিয়েবল",
         "description": "এজেন্টের মেসেজে সম্প্রসারিত হওয়া পুনর্ব্যবহারযোগ্য ভ্যালু"

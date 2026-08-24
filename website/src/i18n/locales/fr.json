@@ -12071,7 +12071,19 @@
         "scope_session": "Session",
         "shadowed_by": "Remplacé par {{scope}}",
         "overrides": "Remplace {{scope}}",
-        "workspace_named": "Espace de travail {{name}}"
+        "workspace_named": "Espace de travail {{name}}",
+        "usage_hint": "Référencez une variable avec {{token}} dans un message, une tâche cron ou le prompt d'une crew.",
+        "remove_variable_confirm": "Confirmer la suppression de {{name}}",
+        "bulk_edit": "Édition groupée",
+        "bulk_label": "Un NOM=valeur par ligne",
+        "bulk_apply": "Appliquer",
+        "bulk_cancel": "Annuler",
+        "bulk_replaces_scope": "Appliquer remplace cette portée : un nom absent du texte est supprimé.",
+        "from_file_note": "Également définies par le fichier de cet espace de travail dans {{dir}}. Modifiez ce fichier pour les changer.",
+        "overridden_by_panel": "remplacé ci-dessus",
+        "scope_workspace_file": "Fichier de l'espace de travail",
+        "file_blocked_not_lowercase": "Pas de fichier de variables : le nom de l'espace doit être en minuscules.",
+        "file_blocked_unusable": "Pas de fichier de variables : ce nom ne peut pas servir de nom de fichier."
       }
     },
     "settingsPage": {
@@ -12490,7 +12502,7 @@
       "secrets": {
         "label": "Secrets",
         "description": "Stockez les clés API et identifiants en toute sécurité"
-    },
+      },
       "variables": {
         "label": "Variables d'environnement",
         "description": "Valeurs réutilisables qui sont insérées dans les messages de l'agent"

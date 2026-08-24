@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor, within, fireEvent } from '@testing-library/react'
+import { act, render, screen, waitFor, within, fireEvent } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import { VariablesPanel, nameError, valueError } from './VariablesPanel'
@@ -25,10 +25,15 @@ function mount() {
   // `retry: false` so a rejected fetch settles on the first rejection instead of
   // outliving the test's timeout.
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
-    <QueryClientProvider client={qc}>
-      <VariablesPanel />
-    </QueryClientProvider>,
+  // The client is handed back so a test can force a refetch MID-EDIT — the only way
+  // to tell a baseline captured when the editor opened from one read at apply time.
+  return Object.assign(
+    render(
+      <QueryClientProvider client={qc}>
+        <VariablesPanel />
+      </QueryClientProvider>,
+    ),
+    { qc },
   )
 }
 
@@ -234,12 +239,50 @@ describe('VariablesPanel', () => {
       variables.mockResolvedValue(view({ global: { BASE_URL: 'https://example.test', REGION: 'eu-west-1' } }))
       mount()
       await ready()
+      // Two clicks: the first ARMS, the second removes. A single mis-click on a
+      // small icon used to be permanent — there is no undo and a value can be 4096
+      // characters.
       fireEvent.click(screen.getByRole('button', { name: 'Remove REGION' }))
+      expect(saveVariables).not.toHaveBeenCalled()
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm removing REGION' }))
 
       await waitFor(() => expect(saveVariables).toHaveBeenCalledWith({
         scope: 'global',
         delete: ['REGION'],
       }))
+    })
+
+    it('keeps a typed edit when the delete is refused', async () => {
+      // The draft used to be cleared BEFORE the request, so a refused delete threw
+      // away what the user had typed and put the stored value back in the input —
+      // on a surface with no undo, for a value that can be 4096 characters. The
+      // row-save path beside it already ties clearing to success; this did not.
+      variables.mockResolvedValue(view({ global: { REGION: 'eu-west-1' } }))
+      saveVariables.mockRejectedValue(new Error('boom'))
+      mount()
+      await ready()
+
+      const input = screen.getByDisplayValue('eu-west-1')
+      fireEvent.change(input, { target: { value: 'us-east-1 (typed, not yet saved)' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Remove REGION' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm removing REGION' }))
+
+      await waitFor(() => expect(saveVariables).toHaveBeenCalled())
+      expect(screen.getByDisplayValue('us-east-1 (typed, not yet saved)')).toBeTruthy()
+    })
+
+    it('clears the draft once the delete lands', async () => {
+      // The other half: tying it to success must not mean never clearing it, or the
+      // stale draft would shadow a later refetch of the same key.
+      variables.mockResolvedValue(view({ global: { REGION: 'eu-west-1' } }))
+      mount()
+      await ready()
+
+      fireEvent.change(screen.getByDisplayValue('eu-west-1'), { target: { value: 'typed' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Remove REGION' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm removing REGION' }))
+
+      await waitFor(() => expect(screen.queryByDisplayValue('typed')).toBeNull())
     })
 
     it('reports a failed write', async () => {
@@ -377,6 +420,7 @@ describe('VariablesPanel', () => {
       mount()
       await ready()
       fireEvent.click(screen.getByRole('button', { name: 'Remove REGION' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm removing REGION' }))
 
       await waitFor(() => expect(saveVariables).toHaveBeenCalledWith({
         scope: 'workspace',
@@ -644,7 +688,11 @@ describe('VariablesPanel remove-vs-edit race', () => {
     fireEvent.change(input, { target: { value: 'https://edited.test' } })
     const remove = screen.getByRole('button', { name: 'Remove BASE_URL' })
     fireEvent.blur(input, { relatedTarget: remove })
+    // The arming click must not resurrect the dropped set either: the blur guard has
+    // to hold across BOTH clicks, not just the one that writes.
     fireEvent.click(remove)
+    expect(saveVariables).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm removing BASE_URL' }))
 
     await waitFor(() => expect(saveVariables).toHaveBeenCalledTimes(1))
     expect(saveVariables).toHaveBeenCalledWith({ scope: 'global', delete: ['BASE_URL'] })
@@ -707,5 +755,388 @@ describe('VariablesPanel stale drafts after a successful edit', () => {
     })
     await new Promise(r => setTimeout(r, 50))
     expect(saveVariables).toHaveBeenCalledTimes(1)
+  })
+})
+
+/**
+ * Deleting is two clicks: arm, then confirm.
+ *
+ * There is no undo and a value can be 4096 characters, so a single mis-click on a
+ * small icon was permanent work loss. The ACCESSIBLE NAME changes between the two
+ * states, not just the colour — a confirm carried only by a colour change is hidden
+ * from exactly the users who cannot see it.
+ */
+describe('VariablesPanel delete confirmation', () => {
+  beforeEach(() => {
+    variables.mockResolvedValue(view({ global: { BASE_URL: 'https://example.test', REGION: 'eu' } }))
+  })
+
+  it('announces the armed state through the accessible name', async () => {
+    mount()
+    await ready()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove REGION' }))
+
+    expect(screen.getByRole('button', { name: 'Confirm removing REGION' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Remove REGION' })).toBeNull()
+  })
+
+  it('arms only the row that was clicked', async () => {
+    mount()
+    await ready()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove REGION' }))
+
+    expect(screen.getByRole('button', { name: 'Remove BASE_URL' })).toBeInTheDocument()
+  })
+
+  it('arming a second row disarms the first, so only one trigger is ever loaded', async () => {
+    mount()
+    await ready()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove REGION' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Remove BASE_URL' }))
+
+    expect(screen.getByRole('button', { name: 'Remove REGION' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Confirm removing BASE_URL' })).toBeInTheDocument()
+    expect(saveVariables).not.toHaveBeenCalled()
+  })
+
+  it('disarms itself after the timeout rather than staying loaded', async () => {
+    vi.useFakeTimers()
+    try {
+      mount()
+      await vi.waitFor(() =>
+        expect(screen.getAllByRole('button', { name: 'Add' })[0]).toBeEnabled(),
+      )
+      fireEvent.click(screen.getByRole('button', { name: 'Remove REGION' }))
+      expect(screen.getByRole('button', { name: 'Confirm removing REGION' })).toBeInTheDocument()
+
+      act(() => { vi.advanceTimersByTime(5000) })
+
+      expect(screen.getByRole('button', { name: 'Remove REGION' })).toBeInTheDocument()
+      expect(saveVariables).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+/** Bulk edit: a whole scope as dotenv text, the way Postman's does it. */
+describe('VariablesPanel arming a delete keeps an in-progress edit', () => {
+  it('does not discard the typed value when the first click only arms', async () => {
+    // The blur-to-Remove guard used to drop the draft, which was right when Remove
+    // deleted immediately. With a confirm step, a user who arms and then walks away
+    // (or lets it time out) would silently lose what they typed.
+    variables.mockResolvedValue(
+      view({ global: { BASE_URL: 'https://example.test' }, winning_scope: { BASE_URL: 'global' } }),
+    )
+    mount()
+    await ready()
+
+    const input = screen.getByRole('textbox', { name: 'BASE_URL Value' })
+    fireEvent.change(input, { target: { value: 'https://edited.test' } })
+    const remove = screen.getByRole('button', { name: 'Remove BASE_URL' })
+    fireEvent.blur(input, { relatedTarget: remove })
+    fireEvent.click(remove)
+
+    expect(saveVariables).not.toHaveBeenCalled()
+    expect(screen.getByRole('textbox', { name: 'BASE_URL Value' })).toHaveValue('https://edited.test')
+  })
+
+  it('still sends no set alongside the delete once confirmed', async () => {
+    // Keeping the draft must not resurrect the double-write this guard exists for.
+    variables.mockResolvedValue(
+      view({ global: { BASE_URL: 'https://example.test' }, winning_scope: { BASE_URL: 'global' } }),
+    )
+    mount()
+    await ready()
+
+    const input = screen.getByRole('textbox', { name: 'BASE_URL Value' })
+    fireEvent.change(input, { target: { value: 'https://edited.test' } })
+    const remove = screen.getByRole('button', { name: 'Remove BASE_URL' })
+    fireEvent.blur(input, { relatedTarget: remove })
+    fireEvent.click(remove)
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm removing BASE_URL' }))
+
+    await waitFor(() => expect(saveVariables).toHaveBeenCalledTimes(1))
+    expect(saveVariables).toHaveBeenCalledWith({ scope: 'global', delete: ['BASE_URL'] })
+  })
+})
+
+describe('VariablesPanel bulk edit', () => {
+  const openBulk = async () => {
+    mount()
+    await ready()
+    fireEvent.click(screen.getAllByRole('button', { name: /Bulk edit/ })[0])
+    return screen.getByRole('textbox', { name: 'One NAME=value per line' })
+  }
+
+  it('seeds the textarea from the current pairs, sorted', async () => {
+    variables.mockResolvedValue(view({ global: { B: 'two', A: 'one' } }))
+    const box = await openBulk()
+    expect(box).toHaveValue('A=one\nB=two')
+  })
+
+  it('quotes only the values that would not survive a bare round trip', async () => {
+    variables.mockResolvedValue(view({ global: { EMPTY: '', PAD: ' x ', PLAIN: 'v' } }))
+    const box = await openBulk()
+    expect(box).toHaveValue('EMPTY=""\nPAD=" x "\nPLAIN=v')
+  })
+
+  it('sends the text verbatim as a bulk write', async () => {
+    variables.mockResolvedValue(view({ global: { A: 'one' } }))
+    const box = await openBulk()
+    fireEvent.change(box, { target: { value: 'A=changed\nB=new\n' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveVariables).toHaveBeenCalledWith({
+      scope: 'global',
+      bulk: 'A=changed\nB=new\n',
+      base: { A: 'one' },
+    }))
+  })
+
+  it('does not pre-validate: the backend owns the grammar and reports the line', async () => {
+    variables.mockResolvedValue(view({ global: {} }))
+    const box = await openBulk()
+    fireEvent.change(box, { target: { value: 'not a pair' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveVariables).toHaveBeenCalledWith({
+      scope: 'global',
+      bulk: 'not a pair',
+      base: {},
+    }))
+  })
+
+  it('surfaces the backend refusal, line number and all', async () => {
+    variables.mockResolvedValue(view({ global: {} }))
+    saveVariables.mockRejectedValue(
+      new ApiError(400, 'Bad Request', JSON.stringify({ error: 'line 2: expected NAME=value' })),
+    )
+    const box = await openBulk()
+    fireEvent.change(box, { target: { value: 'A=1\nbad' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    expect(await screen.findByText('line 2: expected NAME=value')).toBeInTheDocument()
+  })
+
+  it('stays open on a refusal so the text can be corrected', async () => {
+    variables.mockResolvedValue(view({ global: {} }))
+    saveVariables.mockRejectedValue(new ApiError(400, 'Bad Request', JSON.stringify({ error: 'nope' })))
+    const box = await openBulk()
+    fireEvent.change(box, { target: { value: 'bad' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await screen.findByText('nope')
+    expect(screen.getByRole('textbox', { name: 'One NAME=value per line' })).toHaveValue('bad')
+  })
+
+  it('closes once the write lands', async () => {
+    variables.mockResolvedValue(view({ global: { A: '1' } }))
+    const box = await openBulk()
+    fireEvent.change(box, { target: { value: 'A=2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() =>
+      expect(screen.queryByRole('textbox', { name: 'One NAME=value per line' })).toBeNull(),
+    )
+  })
+
+  it('cancel closes without writing', async () => {
+    variables.mockResolvedValue(view({ global: { A: '1' } }))
+    const box = await openBulk()
+    fireEvent.change(box, { target: { value: 'A=2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+
+    expect(screen.queryByRole('textbox', { name: 'One NAME=value per line' })).toBeNull()
+    expect(saveVariables).not.toHaveBeenCalled()
+  })
+
+  it('sends the scope as the editor OPENED it, values included, not the current one', async () => {
+    // The discriminating case, and it needs a refetch mid-edit: another tab adds a
+    // key while this editor is open, so `pairs` changes underneath it. Reading the
+    // baseline at APPLY time would send the new key set and the server's staleness
+    // check would pass — silently deleting the key this operator never saw, which is
+    // the whole failure the check exists to stop.
+    variables.mockResolvedValue(view({ global: { A: '1', B: '2' } }))
+    const { qc } = mount()
+    await ready()
+    fireEvent.click(screen.getAllByRole('button', { name: /Bulk edit/ })[0])
+    const box = screen.getByRole('textbox', { name: 'One NAME=value per line' })
+
+    variables.mockResolvedValue(view({ global: { A: '1', B: '2', ADDED_BY_TAB_B: '3' } }))
+    await act(async () => { await qc.invalidateQueries({ queryKey: ['variables'] }) })
+    // Proof the refetch actually landed: without this the test cannot tell the two
+    // implementations apart and would pass against either.
+    await screen.findByText('ADDED_BY_TAB_B')
+
+    fireEvent.change(box, { target: { value: 'A=1\nB=2\n' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => expect(saveVariables).toHaveBeenCalledWith(
+      expect.objectContaining({ base: { A: '1', B: '2' } }),
+    ))
+    // The baseline carries VALUES, so a value another writer changed is caught too —
+    // not just a key that appeared or vanished.
+    expect(saveVariables).not.toHaveBeenCalledWith(
+      expect.objectContaining({ base: expect.objectContaining({ ADDED_BY_TAB_B: '3' }) }),
+    )
+  })
+
+  it('surfaces the stale-baseline refusal in the operator\'s words', async () => {
+    variables.mockResolvedValue(view({ global: { A: '1' } }))
+    saveVariables.mockRejectedValue(
+      new ApiError(409, 'Conflict', JSON.stringify({
+        error: 'the variables in this scope changed while the bulk editor was open. Reopen it to pick up the current values, then re-apply.',
+        code: 'variables_stale_bulk_base',
+      })),
+    )
+    const box = await openBulk()
+    fireEvent.change(box, { target: { value: 'A=2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    expect(await screen.findByText(/changed while the bulk editor was open/)).toBeInTheDocument()
+  })
+
+  it('says that applying deletes what the text omits', async () => {
+    variables.mockResolvedValue(view({ global: { A: '1' } }))
+    await openBulk()
+    // The destructive half is invisible: nothing on screen shows a key that is not
+    // in the text, so the warning is the only thing that can carry it.
+    expect(
+      screen.getByText('Applying replaces this scope: a name missing from the text is removed.'),
+    ).toBeInTheDocument()
+  })
+})
+
+/** The read-only dotenv layer a workspace file supplies. */
+describe('VariablesPanel workspace file layer', () => {
+  const withFile = () =>
+    view({
+      workspaces: { research: { SHARED: 'from-panel' } },
+      workspace_files: { research: { SHARED: 'from-file', FILE_ONLY: 'x' } },
+      workspace_file_dir: '/home/u/.kiro/crew/variables/workspaces',
+      active_workspace: 'research',
+    })
+
+  it('shows the file pairs and names the directory to edit', async () => {
+    variables.mockResolvedValue(withFile())
+    mount()
+    await ready()
+
+    expect(await screen.findByText('FILE_ONLY')).toBeInTheDocument()
+    expect(
+      screen.getByText(/\/home\/u\/\.kiro\/crew\/variables\/workspaces/),
+    ).toBeInTheDocument()
+  })
+
+  it('marks a file key the panel overrides, so a shadowed edit does not read as a no-op', async () => {
+    variables.mockResolvedValue(withFile())
+    mount()
+    await ready()
+
+    expect(await screen.findByText('overridden above')).toBeInTheDocument()
+  })
+
+  it('offers no edit controls for a file key: this panel does not write those files', async () => {
+    variables.mockResolvedValue(withFile())
+    mount()
+    await ready()
+
+    await screen.findByText('FILE_ONLY')
+    expect(screen.queryByRole('button', { name: 'Remove FILE_ONLY' })).toBeNull()
+    expect(screen.queryByRole('textbox', { name: 'FILE_ONLY Value' })).toBeNull()
+  })
+
+  it('renders nothing when a workspace has no file', async () => {
+    variables.mockResolvedValue(view({ workspaces: { research: { A: '1' } }, workspace_files: { research: {} } }))
+    mount()
+    await ready()
+
+    expect(screen.queryByText('overridden above')).toBeNull()
+  })
+})
+
+describe('VariablesPanel file-scope shadowing', () => {
+  it('names the workspace file as the winner instead of showing a raw scope key', async () => {
+    // The file layer now appears in `winning_scope`, so an unlabelled scope would
+    // render the wire value `workspace_file` straight into the UI.
+    variables.mockResolvedValue(
+      view({
+        global: { SHARED: 'from-global' },
+        winning_scope: { SHARED: 'workspace_file' },
+      }),
+    )
+    mount()
+    await ready()
+
+    expect(await screen.findByText('Shadowed by Workspace file')).toBeInTheDocument()
+  })
+
+  it('ranks the file above global, so a shadowed global row is marked as shadowed', async () => {
+    // RANK decides this: an unranked scope falls back to 0, which reads as
+    // "broadest" and would leave the row looking like the winner.
+    variables.mockResolvedValue(
+      view({
+        global: { SHARED: 'from-global' },
+        winning_scope: { SHARED: 'workspace_file' },
+      }),
+    )
+    mount()
+    await ready()
+
+    expect(await screen.findByText(/Shadowed by/)).toBeInTheDocument()
+  })
+})
+
+describe('VariablesPanel says why a workspace has no file layer', () => {
+  it('explains a name that is not lowercase', async () => {
+    // Otherwise the workspace shows no file rows and the reason lives only in a
+    // gateway log the operator will never open — the invisible failure this feature
+    // avoids everywhere else.
+    variables.mockResolvedValue(view({
+      workspaces: { Ops: { A: '1' } },
+      workspace_files: {},
+      workspace_file_blocked: { Ops: 'name_not_lowercase' },
+    }))
+    mount()
+    await ready()
+
+    expect(await screen.findByText(/must be lowercase/)).toBeInTheDocument()
+  })
+
+  it('explains a name that cannot be a filename at all', async () => {
+    variables.mockResolvedValue(view({
+      workspaces: { 'a/b': { A: '1' } },
+      workspace_files: {},
+      workspace_file_blocked: { 'a/b': 'name_unusable' },
+    }))
+    mount()
+    await ready()
+
+    expect(await screen.findByText(/can't be a filename/)).toBeInTheDocument()
+  })
+
+  it('says nothing for a workspace that can have one', async () => {
+    variables.mockResolvedValue(view({
+      workspaces: { ops: { A: '1' } },
+      workspace_files: { ops: {} },
+      workspace_file_blocked: {},
+    }))
+    mount()
+    await ready()
+
+    expect(screen.queryByText(/No variables file/)).toBeNull()
+  })
+})
+
+describe('VariablesPanel usage hint', () => {
+  it('teaches the token syntax, which appears in no other shipped string', async () => {
+    variables.mockResolvedValue(view())
+    mount()
+    await ready()
+
+    expect(
+      screen.getByText(/Reference a variable as \{\{name\}\} in a message/),
+    ).toBeInTheDocument()
   })
 })

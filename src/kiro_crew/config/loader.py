@@ -8381,12 +8381,24 @@ def resolve_crew_identity(
 
 
 SCOPE_GLOBAL = "global"
+# A dotenv file the operator keeps per workspace, under the fenced store directory.
+# Ranked BELOW the panel's workspace scope so an edit made in the UI takes effect
+# immediately: a panel that silently loses to a file on disk is a panel that lies. The
+# file is the checked-in base, the panel the per-machine override -- the same
+# relationship `.env` and `.env.local` have everywhere else.
+SCOPE_WORKSPACE_FILE = "workspace_file"
 SCOPE_WORKSPACE = "workspace"
 SCOPE_CREW = "crew"
 SCOPE_SESSION = "session"
 
 # Broadest to narrowest. A narrower scope overrides a broader one per key.
-VARIABLE_SCOPES: tuple[str, ...] = (SCOPE_GLOBAL, SCOPE_WORKSPACE, SCOPE_CREW, SCOPE_SESSION)
+VARIABLE_SCOPES: tuple[str, ...] = (
+    SCOPE_GLOBAL,
+    SCOPE_WORKSPACE_FILE,
+    SCOPE_WORKSPACE,
+    SCOPE_CREW,
+    SCOPE_SESSION,
+)
 
 
 @dataclass
@@ -8402,21 +8414,6 @@ class VariableResolution:
     # report the resolution without repeating the selection rules.
     agent_name: str = ""
     workspace_name: str = ""
-
-
-def variable_values_for(agent_name: str | None = None) -> dict[str, str]:
-    """The effective variable map for *agent_name*, or empty when unavailable.
-
-    Never raises: a malformed or unreadable config leaves text unexpanded rather
-    than failing the turn, since a variable is a convenience and the message is
-    still what its author meant to send. Callers that need provenance use
-    :func:`resolve_variables` directly.
-    """
-    try:
-        return dict(resolve_variables(KiroCrewConfig.load(), agent_name or None).values)
-    except Exception:
-        logger.debug("crew-variable resolution failed; text left unexpanded", exc_info=True)
-        return {}
 
 
 def _store_layer(scope: str, name: str, fallback: dict[str, str]) -> dict[str, str]:
@@ -8508,6 +8505,15 @@ def resolve_variables(
         (SCOPE_GLOBAL, _store_layer(SCOPE_GLOBAL, "", config.variables))
     ]
     ws_cfg = config.workspaces.get(ws_name) if ws_name else None
+    if ws_name:
+        # Keyed on the NAME, not on `ws_cfg`: a workspace can carry a dotenv file
+        # before it has a config entry, and dropping the layer in that case would make
+        # the file silently inert for exactly the operator who just created it.
+        from kiro_crew.config import variables_store as _vs
+
+        file_pairs = _vs.workspace_env_values(ws_name)
+        if file_pairs:
+            layers.append((SCOPE_WORKSPACE_FILE, file_pairs))
     if ws_cfg is not None:
         layers.append((SCOPE_WORKSPACE, _store_layer(SCOPE_WORKSPACE, ws_name, ws_cfg.variables)))
     if crew_cfg is not None:

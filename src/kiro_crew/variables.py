@@ -59,7 +59,17 @@ MAX_VALUE_LEN = 4096
 # Tab is the one control character allowed: it appears in legitimate pasted
 # values. Every other C0 code and DEL is rejected, newline included — a value
 # spanning lines could otherwise forge a context header in the assembled prompt.
-_FORBIDDEN_CHARS = frozenset(chr(c) for c in range(0x20) if c != 0x09) | {chr(0x7F)}
+# Unicode line/paragraph separators and NEL are line breaks to `str.splitlines`, to
+# many editors, and to anything that re-splits assembled text -- so they carry the
+# same forge-a-context-header risk as `\n`, which is why they are refused beside it.
+# Concretely: a value holding U+2028 rendered into the bulk editor and re-parsed used
+# to split into two lines, truncating the value AND persisting whatever followed as a
+# second variable.
+_UNICODE_LINE_BREAKS = frozenset("\u2028\u2029\u0085\u000b\u000c\u001c\u001d\u001e")
+
+_FORBIDDEN_CHARS = (
+    frozenset(chr(c) for c in range(0x20) if c != 0x09) | {chr(0x7F)} | _UNICODE_LINE_BREAKS
+)
 
 
 def validate_pair(key: object, value: object) -> tuple[str | None, str]:
@@ -135,3 +145,143 @@ def expand(text: str, values: Mapping[str, str]) -> tuple[str, frozenset[str]]:
         return match.group(0)
 
     return TOKEN_RE.sub(_replace, text), frozenset(unresolved)
+
+
+# A dotenv line: optional `export `, a name, `=`, then the rest of the line. The
+# value is captured raw and cleaned separately, because quote handling and the
+# validity rules are different concerns and mixing them into one pattern is what
+# makes a dotenv parser unreadable.
+# What a dotenv line may be trimmed of, spelled out rather than left to `str.strip()`.
+# Bare `.strip()` removes everything `str.isspace()` covers, which OVERLAPS
+# `_FORBIDDEN_CHARS` -- so the convenient call is the one that erases exactly the
+# characters we are trying to catch. Tab is trimmable at the edges and legal inside.
+_TRIMMABLE = " \t"
+
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
+
+_DOTENV_LINE_RE = re.compile(r"^\s*(?:export\s+)?([^=\s]+)\s*=(.*)$")
+
+
+def _unquote(raw: str) -> str:
+    """Strip one matching pair of surrounding quotes from a dotenv value.
+
+    Escape sequences are deliberately NOT interpreted. ``\\n`` stays two characters
+    rather than becoming a newline, because :func:`validate_pair` forbids newlines in
+    a value anyway — interpreting the escape would turn a legal line into a rejected
+    one and leave the operator staring at a value that looks fine. The same goes for
+    ``\\t``: a real tab can simply be typed.
+    """
+    value = raw.strip(_TRIMMABLE)
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def parse_dotenv(text: str) -> tuple[dict[str, str], list[tuple[int, str]]]:
+    """Parse dotenv-format *text* into pairs, plus per-line problems.
+
+    Returns ``(pairs, problems)`` where each problem is ``(line_number, reason)``
+    with 1-based line numbers, so a caller can point at the offending line rather
+    than rejecting a whole paste with one unattributed message.
+
+    Both callers of this parser want the same grammar but a different STRICTNESS,
+    which is why the problems are returned rather than raised:
+
+    * The bulk-edit endpoint refuses the whole write when there is any problem. The
+      operator is present and looking at the text, so the fixable moment is now.
+    * A workspace ``.env`` file on disk keeps its good pairs and logs the rest. The
+      operator is absent, one bad line must not blank a whole workspace's variables,
+      and an unresolved ``{{token}}`` is this feature's visible failure mode by
+      design — the same reason :func:`expand` leaves an unknown name in place rather
+      than substituting an empty string.
+
+    Duplicate keys take the LAST value, matching every other dotenv reader, but the
+    duplicate is still reported: silently dropping one of two lines the operator
+    wrote is the failure they would not notice.
+
+    Names and values are validated through :func:`validate_pair`, so a pair that
+    arrives from a file obeys exactly the rules a pair typed into the panel does. A
+    dotenv file cannot become a way in for a value the API would refuse.
+    """
+    pairs: dict[str, str] = {}
+    problems: list[tuple[int, str]] = []
+
+    # CR/LF only, NOT `str.splitlines()`: that splits on U+2028, U+2029, NEL and the
+    # C1 separators too, so one physical line could become two records. Belt and
+    # braces with the `_FORBIDDEN_CHARS` refusal above -- the grammar should not depend
+    # on the validator having thought of every separator.
+    for lineno, line in enumerate(_LINE_BREAK_RE.split(text), start=1):
+        # Checked on the RAW line, before anything trims it. Three separate cleaners
+        # run below -- this blank/comment probe, the key trim, and `_unquote` -- and a
+        # bare `.strip()` in any of them eats 11 of the characters in `_FORBIDDEN_CHARS`
+        # (every C0 separator, NEL, LS, PS), which silently TRUNCATES the value and then
+        # hands the validator a clean string that passes. `A=prefix<LS>` saved as
+        # `prefix`, with a 200 and no reported problem, on a path with no undo.
+        #
+        # So the refusal lives at the boundary rather than in each cleaner: the value is
+        # not the only place one of these can hide, and a future cleaner must not be able
+        # to reopen this by trimming one character more than it meant to.
+        if _FORBIDDEN_CHARS.intersection(line):
+            problems.append((lineno, "line contains a control or separator character"))
+            continue
+        stripped = line.strip(_TRIMMABLE)
+        # A `#` only starts a comment at the START of a line. Mid-line it is an
+        # ordinary character: `token=abc#123` is a value, not a truncated one.
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _DOTENV_LINE_RE.match(line)
+        if not match:
+            problems.append((lineno, "expected NAME=value"))
+            continue
+        raw_key, raw_value = match.group(1), match.group(2)
+        key, coerced = validate_pair(raw_key.strip(_TRIMMABLE), _unquote(raw_value))
+        if key is None:
+            problems.append((lineno, coerced))
+            continue
+        if key in pairs:
+            problems.append((lineno, f"duplicate name {key!r}; the last value wins"))
+        pairs[key] = coerced
+
+    return pairs, problems
+
+
+def _needs_quoting(value: str) -> bool:
+    """Whether *value* must be wrapped so :func:`parse_dotenv` returns it unchanged.
+
+    Three cases, and the third is the one that is easy to miss:
+
+    * empty -- a bare ``K=`` is legal input but reads as a mistake, and quoting keeps
+      the deliberate-override intent visible;
+    * whitespace at either end, which an unquoted re-parse trims;
+    * a value that is ALREADY a matching quote pair. ``"hello"`` is a legal stored
+      value, and emitting it bare means the re-parse strips the operator's own quotes
+      and silently shortens the value -- on a save path with no undo. Wrapping it
+      again round-trips, because ``_unquote`` removes only the OUTERMOST pair.
+    """
+    if value == "" or value != value.strip(_TRIMMABLE):
+        return True
+    return len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"')
+
+
+def render_dotenv(pairs: Mapping[str, str]) -> str:
+    """Render *pairs* as dotenv text, sorted by name.
+
+    The inverse of :func:`parse_dotenv` for every value that round-trips: a value is
+    quoted only when it would not survive the trip bare — one that is empty, or whose
+    ends carry whitespace a re-parse would strip. Quoting everything would be simpler
+    and is what most writers do, but this text is shown to the operator in a textarea,
+    and a wall of unnecessary quotes is the thing that makes a generated dotenv file
+    look machine-owned and discourage hand-editing.
+
+    An INTERIOR quote needs no escaping, because only a matching surrounding pair is
+    stripped on the way back in. A value that is ITSELF wrapped in a matching pair
+    does need it -- see :func:`_needs_quoting`.
+    """
+    lines: list[str] = []
+    for key in sorted(pairs):
+        value = pairs[key]
+        if _needs_quoting(value):
+            lines.append(f'{key}="{value}"')
+        else:
+            lines.append(f"{key}={value}")
+    return "\n".join(lines)

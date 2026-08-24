@@ -100,3 +100,4 @@ agent loads only the one it needs.
 | [cloud.md](cloud.md) | Cloud connect and remote gateway login. |
 | [instances.md](instances.md) | Managing multiple instances over SSH. Sections here are cited by number from `cloud/connect.py`, so do not renumber them. |
 | [dev-fleet.md](dev-fleet.md) | Worktree fleet management and pruning. |
+| [variables.md](variables.md) | `{{name}}` substitution: the five-scope cascade, the fenced store, and the operator-authored trust boundary. |

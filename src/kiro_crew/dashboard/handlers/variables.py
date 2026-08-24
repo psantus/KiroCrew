@@ -53,7 +53,7 @@ from kiro_crew.config import variables_store as vstore
 from kiro_crew.config.loader import ConfigReadError, KiroCrewConfig, resolve_variables
 from kiro_crew.dashboard.chat_utils import run_config_write
 from kiro_crew.sel import sel
-from kiro_crew.variables import validate_pair
+from kiro_crew.variables import parse_dotenv, validate_pair
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,20 @@ def _view(cfg: KiroCrewConfig, doc: dict) -> dict:
         "global": vstore.global_values(doc),
         "workspaces": {name: dict(ws_stored.get(name, {})) for name in cfg.workspaces},
         "crews": {name: dict(crew_stored.get(name, {})) for name in cfg.agents},
+        # Read-only: this endpoint does not write the dotenv files, so the panel shows
+        # them without edit controls. Reported at all because a value the operator
+        # cannot see is a value they cannot debug -- a file-defined key that a panel
+        # key shadows would otherwise look like the panel edit had no effect.
+        "workspace_files": {name: vstore.workspace_env_values(name) for name in cfg.workspaces},
+        "workspace_file_dir": str(vstore.workspace_env_dir()),
+        # Why a workspace has no file layer, when it cannot have one. Reported so the
+        # panel can say it: a workspace silently showing no file rows, with the reason
+        # only in a log, is the invisible failure this feature avoids elsewhere.
+        "workspace_file_blocked": {
+            name: reason
+            for name in cfg.workspaces
+            if (reason := vstore.workspace_env_block_reason(name))
+        },
         "effective": dict(resolution.values),
         "winning_scope": dict(resolution.winning_scope),
         "shadowed": {key: list(scopes) for key, scopes in resolution.shadowed.items()},
@@ -169,11 +183,22 @@ async def api_variables(request: web.Request) -> web.Response:
 
     raw_set = body.get("set")
     raw_delete = body.get("delete")
-    if raw_set is None and raw_delete is None:
+    raw_bulk = body.get("bulk")
+    # Only a bulk write carries a baseline. A per-key `set`/`delete` names its own
+    # keys, so it cannot lose an edit it never mentioned and needs no compare.
+    expect: dict[str, str] | None = None
+    if raw_bulk is not None and (raw_set is not None or raw_delete is not None):
+        return _deny(
+            "variables_conflicting_change",
+            "'bulk' replaces the whole scope, so it cannot be combined with " "'set' or 'delete'",
+        )
+    if raw_bulk is None and raw_set is None and raw_delete is None:
         return _deny(
             "variables_invalid_values",
-            "body must carry 'set' (object) and/or 'delete' (array of names)",
+            "body must carry 'set' (object), 'delete' (array of names), or " "'bulk' (dotenv text)",
         )
+    if raw_bulk is not None and not isinstance(raw_bulk, str):
+        return _deny("variables_invalid_values", "bulk must be a string of dotenv text")
     if raw_set is not None and not isinstance(raw_set, dict):
         return _deny("variables_invalid_values", "set must be an object")
     if raw_delete is not None and not isinstance(raw_delete, list):
@@ -237,6 +262,54 @@ async def api_variables(request: web.Request) -> web.Response:
                 f"unknown workspace: {workspace!r}",
             )
 
+    if raw_bulk is not None:
+        # STRICT, unlike the same parser reading a file on disk: the operator is
+        # looking at this text right now, so the fixable moment is now. A file has
+        # nobody watching and keeps its good pairs instead.
+        parsed, problems = parse_dotenv(raw_bulk)
+        if problems:
+            lineno, reason = problems[0]
+            sel().log_api_access(
+                caller=caller,
+                operation="variables.update",
+                outcome="denied",
+                error=f"bulk line {lineno}: {reason}",
+            )
+            return web.json_response(
+                {
+                    "error": f"line {lineno}: {reason}",
+                    "code": "variables_invalid_bulk",
+                    "line": lineno,
+                },
+                status=400,
+            )
+        # The scope as the editor rendered it, VALUES included, compared inside the
+        # locked mutation rather than here. A check before the lock is a TOCTOU: two
+        # applies can both read the same "current", both agree with their own baseline,
+        # and the second still clobbers the first. Comparing on values and not just key
+        # presence is the other half — a value another writer changed since this editor
+        # rendered would otherwise be reverted by text its operator never saw.
+        #
+        # A missing baseline is refused rather than defaulted, because a client that
+        # omits it would get the destructive path for free.
+        raw_base = body.get("base")
+        if not isinstance(raw_base, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in raw_base.items()
+        ):
+            return _deny(
+                "variables_invalid_values",
+                "bulk must carry 'base' (an object of the name/value pairs the editor "
+                "was opened on)",
+            )
+        expect = dict(raw_base)
+
+        # Still a per-key diff, so deletion stays "absence" with no second verb — but
+        # derived from the BASELINE, which the locked mutation proves identical to the
+        # stored scope before it applies anything. A pre-lock read would reintroduce
+        # exactly the window the `expect` check exists to close.
+        values = dict(parsed)
+        removals = [name for name in expect if name not in parsed]
+
     # Routed through run_config_write, which holds BOTH config locks: the loop-side
     # asyncio lock and, inside the worker thread, the store's own advisory flock via
     # update_config_locked. The blocking wait therefore never happens on the event
@@ -248,6 +321,24 @@ async def api_variables(request: web.Request) -> web.Response:
             name=workspace,
             values=values,
             removals=removals,
+            expect=expect,
+        )
+    except vstore.StaleBaseline:
+        sel().log_api_access(
+            caller=caller,
+            operation="variables.update",
+            outcome="denied",
+            error="bulk baseline is stale",
+        )
+        return web.json_response(
+            {
+                "error": (
+                    "the variables in this scope changed while the bulk editor was "
+                    "open. Reopen it to pick up the current values, then re-apply."
+                ),
+                "code": "variables_stale_bulk_base",
+            },
+            status=409,
         )
     except vstore.MalformedStore as exc:
         return _deny(

@@ -40,6 +40,7 @@ in the **same commit** when you change what it documents.
 | sessions, slots, session keys, PIDs | [session](docs/system-specs/modules/session.md) + [history](docs/system-specs/modules/history.md) |
 | session summaries, the chat summary panel, intent extraction | [session-summary](docs/system-specs/modules/session-summary.md) |
 | memory, embeddings, vectors, lessons, skills, hooks | [memory-skills-hooks](docs/system-specs/modules/memory-skills-hooks.md) |
+| variables, `{{name}}` substitution, the variables store | [variables](docs/system-specs/modules/variables.md) |
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
 | artifacts, companion chat | [artifacts](docs/system-specs/modules/artifacts.md) |

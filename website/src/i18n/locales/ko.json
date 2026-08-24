@@ -11812,7 +11812,19 @@
         "scope_session": "세션",
         "shadowed_by": "{{scope}}에 의해 덮어써짐",
         "overrides": "{{scope}}을(를) 덮어씀",
-        "workspace_named": "워크스페이스 {{name}}"
+        "workspace_named": "워크스페이스 {{name}}",
+        "usage_hint": "메시지, cron 작업 또는 Crew 프롬프트에서 변수를 {{token}} 형태로 참조합니다.",
+        "remove_variable_confirm": "{{name}} 삭제 확인",
+        "bulk_edit": "일괄 편집",
+        "bulk_label": "한 줄에 하나씩 NAME=value",
+        "bulk_apply": "적용",
+        "bulk_cancel": "취소",
+        "bulk_replaces_scope": "적용하면 이 범위가 교체됩니다. 텍스트에 없는 이름은 삭제됩니다.",
+        "from_file_note": "이 워크스페이스의 {{dir}} 파일에도 정의되어 있습니다. 변경하려면 해당 파일을 편집하세요.",
+        "overridden_by_panel": "위에서 덮어씀",
+        "scope_workspace_file": "워크스페이스 파일",
+        "file_blocked_not_lowercase": "변수 파일 없음: 워크스페이스 이름은 소문자여야 합니다.",
+        "file_blocked_unusable": "변수 파일 없음: 이 이름은 파일 이름으로 사용할 수 없습니다."
       }
     },
     "settingsPage": {
@@ -12215,7 +12227,7 @@
       "secrets": {
         "label": "Secrets",
         "description": "API 키와 자격 증명을 안전하게 저장"
-    },
+      },
       "variables": {
         "label": "환경 변수",
         "description": "에이전트 메시지 안에서 확장되는 재사용 가능한 값"

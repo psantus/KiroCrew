@@ -32,8 +32,10 @@ MACHINE_SURFACES = [
 FORBIDDEN = (
     "from kiro_crew.variables import",
     "import kiro_crew.variables",
-    "variable_values_for",
     "resolve_variables",
+    # The per-workspace dotenv layer resolves through the same cascade, so a surface
+    # that reached for it directly would bypass this list's other needles.
+    "workspace_env_values",
 )
 
 

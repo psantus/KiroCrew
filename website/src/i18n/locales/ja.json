@@ -11812,7 +11812,19 @@
         "scope_session": "セッション",
         "shadowed_by": "{{scope}} によって上書きされています",
         "overrides": "{{scope}} を上書きします",
-        "workspace_named": "ワークスペース {{name}}"
+        "workspace_named": "ワークスペース {{name}}",
+        "usage_hint": "メッセージ、cron ジョブ、Crew のプロンプトでは {{token}} の形で変数を参照します。",
+        "remove_variable_confirm": "{{name}} の削除を確認",
+        "bulk_edit": "一括編集",
+        "bulk_label": "1 行に 1 つの NAME=value",
+        "bulk_apply": "適用",
+        "bulk_cancel": "キャンセル",
+        "bulk_replaces_scope": "適用するとこのスコープが置き換わります。テキストにない名前は削除されます。",
+        "from_file_note": "このワークスペースの {{dir}} にあるファイルでも定義されています。変更するにはそのファイルを編集してください。",
+        "overridden_by_panel": "上で上書き済み",
+        "scope_workspace_file": "ワークスペースファイル",
+        "file_blocked_not_lowercase": "変数ファイルなし: ワークスペース名は小文字である必要があります。",
+        "file_blocked_unusable": "変数ファイルなし: この名前はファイル名として使用できません。"
       }
     },
     "settingsPage": {
@@ -12215,7 +12227,7 @@
       "secrets": {
         "label": "Secrets",
         "description": "APIキーと資格情報を安全に保存"
-    },
+      },
       "variables": {
         "label": "環境変数",
         "description": "エージェントのメッセージ内に展開される再利用可能な値"

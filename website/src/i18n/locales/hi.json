@@ -11942,7 +11942,19 @@
         "scope_session": "सेशन",
         "shadowed_by": "{{scope}} द्वारा अधिलेखित",
         "overrides": "{{scope}} को अधिलेखित करता है",
-        "workspace_named": "वर्कस्पेस {{name}}"
+        "workspace_named": "वर्कस्पेस {{name}}",
+        "usage_hint": "किसी मैसेज, क्रॉन जॉब या क्रू के प्रॉम्प्ट में वेरिएबल को {{token}} के रूप में इस्तेमाल करो।",
+        "remove_variable_confirm": "{{name}} हटाने की पुष्टि करो",
+        "bulk_edit": "बल्क एडिट",
+        "bulk_label": "प्रति पंक्ति एक NAME=value",
+        "bulk_apply": "लागू करो",
+        "bulk_cancel": "रद्द करो",
+        "bulk_replaces_scope": "लागू करने पर यह स्कोप बदल जाएगा: टेक्स्ट में मौजूद न होने वाला नाम हट जाएगा।",
+        "from_file_note": "इस वर्कस्पेस की फ़ाइल ({{dir}}) में भी परिभाषित। बदलने के लिए उस फ़ाइल को संपादित करो।",
+        "overridden_by_panel": "ऊपर अधिलेखित",
+        "scope_workspace_file": "वर्कस्पेस फ़ाइल",
+        "file_blocked_not_lowercase": "वेरिएबल फ़ाइल नहीं: वर्कस्पेस का नाम लोअरकेस होना चाहिए।",
+        "file_blocked_unusable": "वेरिएबल फ़ाइल नहीं: यह नाम फ़ाइल नाम नहीं बन सकता।"
       }
     },
     "settingsPage": {
@@ -12353,7 +12365,7 @@
       "secrets": {
         "label": "Secrets",
         "description": "API कुंजियाँ और क्रेडेंशियल सुरक्षित रूप से संग्रहीत करें"
-    },
+      },
       "variables": {
         "label": "एनवायरनमेंट वेरिएबल",
         "description": "एजेंट के मैसेज में विस्तारित होने वाले पुनःप्रयोज्य मान"

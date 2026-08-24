@@ -33,8 +33,22 @@ const store = {
   workspaces: {
     default: {},
     ops: { baseUrl: 'https://api.example.com', pagerRotation: 'primary' },
+    Reports: { weeklyOwner: 'ana' },
   },
 }
+
+/** Pairs a workspace's dotenv file supplies. Read-only in the panel, so this is
+ *  never mutated by the stubbed PUT. `baseUrl` is deliberately also a panel pair,
+ *  so a shot shows the override marker rather than only the happy case. */
+const workspaceFiles = {
+  default: {},
+  ops: { baseUrl: 'https://api.from-file.example', deployTarget: 'staging', retries: '3' },
+}
+const workspaceFileDir = '/home/you/.kiro/crew/variables/workspaces'
+
+/** Why a workspace can have no file. `Reports` is mixed case, which a
+ *  case-insensitive filesystem would fold onto another workspace's file. */
+const workspaceFileBlocked = { Reports: 'name_not_lowercase' }
 
 /** The effective map for the ops workspace, narrowest scope winning. */
 function view() {
@@ -45,16 +59,55 @@ function view() {
     effective[k] = v
     winning[k] = 'workspace'
   }
-  return { global: store.global, workspaces: store.workspaces, effective, winning_scope: winning }
+  // The file layer sits between global and the panel's workspace scope, so a
+  // file key wins over global and loses to a panel key of the same name.
+  const shadowed = {}
+  for (const [k, v] of Object.entries(workspaceFiles.ops)) {
+    if (!(k in store.workspaces.ops)) {
+      if (k in effective) (shadowed[k] ||= []).push(winning[k])
+      effective[k] = v
+      winning[k] = 'workspace_file'
+    } else if (k in effective) {
+      (shadowed[k] ||= []).push('workspace_file')
+    }
+  }
+  return {
+    global: store.global,
+    workspaces: store.workspaces,
+    effective,
+    winning_scope: winning,
+    shadowed,
+    active_workspace: 'ops',
+    workspace_files: workspaceFiles,
+    workspace_file_dir: workspaceFileDir,
+    workspace_file_blocked: workspaceFileBlocked,
+  }
 }
 
 function extra(path, route) {
   if (path !== '/api/variables') return false
   if (route.request().method() === 'PUT') {
     const body = JSON.parse(route.request().postData() || '{}')
-    if (body.scope === 'global') store.global = body.values || {}
-    else if (body.scope === 'workspace') store.workspaces[body.workspace] = body.values || {}
-    json(route, { ok: true })
+    const target = body.scope === 'global' ? store.global : (store.workspaces[body.workspace] ||= {})
+    if (typeof body.bulk === 'string') {
+      // The real endpoint parses server-side and applies a per-key diff. A minimal
+      // stand-in is enough here: these shots are evidence of the UI, and the
+      // grammar itself is covered by test_variables_dotenv.py.
+      for (const k of Object.keys(target)) delete target[k]
+      for (const line of body.bulk.split('\n')) {
+        const m = /^\s*(?:export\s+)?([^=\s]+)\s*=(.*)$/.exec(line)
+        if (!m || line.trim().startsWith('#')) continue
+        let v = m[2].trim()
+        if (v.length >= 2 && v[0] === v[v.length - 1] && (v[0] === '"' || v[0] === "'")) {
+          v = v.slice(1, -1)
+        }
+        target[m[1].trim()] = v
+      }
+    } else {
+      for (const [k, v] of Object.entries(body.set || {})) target[k] = v
+      for (const k of body.delete || []) delete target[k]
+    }
+    json(route, { ok: true, ...view() })
     return true
   }
   json(route, view())
@@ -128,6 +181,55 @@ async function openPanel() {
   const { ctx, page } = await openPanel()
   await page.screenshot({ path: join(OUT, '04-full-panel.png'), fullPage: true })
   console.log('04-full-panel.png')
+  await ctx.close()
+}
+
+// Shot 7 — bulk edit open, seeded from the current pairs.
+{
+  const { ctx, page } = await openPanel()
+  await page.getByRole('button', { name: /Bulk edit/ }).first().click()
+  await page.getByRole('textbox', { name: 'One NAME=value per line' }).first().waitFor({ timeout: 5000 })
+  await page.waitForTimeout(200)
+  await page.screenshot({ path: join(OUT, '07-bulk-edit.png') })
+  console.log('07-bulk-edit.png')
+  await ctx.close()
+}
+
+// Shot 8 — a delete armed. The accessible NAME changes, not just the colour, so
+// the confirm reaches a screen reader too; the frame shows the visual half.
+{
+  const { ctx, page } = await openPanel()
+  await page.getByRole('button', { name: 'Remove region' }).first().click()
+  await page.getByRole('button', { name: 'Confirm removing region' }).first().waitFor({ timeout: 5000 })
+  await page.waitForTimeout(200)
+  await page.screenshot({ path: join(OUT, '08-delete-armed.png') })
+  console.log('08-delete-armed.png')
+  await ctx.close()
+}
+
+// Shot 9 — the read-only dotenv layer under the ops workspace, including the
+// marker on the key a panel pair overrides.
+{
+  const { ctx, page } = await openPanel()
+  const marker = page.getByText('overridden above').first()
+  await marker.waitFor({ timeout: 5000 })
+  await marker.scrollIntoViewIfNeeded()
+  await page.waitForTimeout(300)
+  await page.screenshot({ path: join(OUT, '09-workspace-file-layer.png') })
+  console.log('09-workspace-file-layer.png')
+  await ctx.close()
+}
+
+// Shot 10 — a workspace that cannot have a dotenv file, and why. Without this the
+// workspace shows no file rows and the reason lives only in a gateway log.
+{
+  const { ctx, page } = await openPanel()
+  const note = page.getByText(/name must be lowercase/).first()
+  await note.waitFor({ timeout: 5000 })
+  await note.scrollIntoViewIfNeeded()
+  await page.waitForTimeout(300)
+  await page.screenshot({ path: join(OUT, '10-file-blocked-reason.png') })
+  console.log('10-file-blocked-reason.png')
   await ctx.close()
 }
 
