@@ -52,6 +52,7 @@ import {
   findTokenRanges,
 } from '../utils/pasteTokens'
 import type { SendMode } from '../pages/chat/ChatSettings'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
 // Upload picker accept hints. Client-side ONLY (UX) — the server validates type
 // (magic bytes), size, and runs malware scanning per input-validation guidance.
@@ -685,6 +686,7 @@ function ChatInput({
   connected = true,
   onOptimizeResult,
 }: ChatInputProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const disabled = disabledProp
   const dispatch = useAppDispatch()
   const slotId = useSlotId()
